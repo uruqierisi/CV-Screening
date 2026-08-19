@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import * as errorsModule from '../../src/agents/errors.js';
 import {
   AgentError,
   DuplicateRatingError,
@@ -17,13 +18,32 @@ import { AGENT_ERROR_CODES } from '../../src/agents/constants.js';
  * retryability label, and what is and is not in `details`.
  */
 
-const ALL = [
+/**
+ * The two whose retry changes the **generation** rather than the argument: the
+ * model returned a response that came up short, and asking again produces a
+ * different response rather than a second reading of the same one.
+ */
+const RETRYABLE = [
   new IncompleteEvaluationError(['c-a', 'c-b']),
+  new SummaryContainsScoreError({
+    patternId: 'percentage',
+    description: 'a percentage, in symbol or spelled form',
+    match: '80%',
+  }),
+];
+
+/**
+ * Everything whose input is fixed. Re-running the same pure function over the
+ * same argument fails identically, so a retry is waste.
+ */
+const NOT_RETRYABLE = [
   new DuplicateRatingError(['c-a']),
   new InvalidRatingError('c-a', 11),
   new InvalidRoleError('weights are wrong', { weightSum: 80 }),
   new UnknownRuleTypeError('required_language', ['min_years_experience']),
 ];
+
+const ALL = [...RETRYABLE, ...NOT_RETRYABLE];
 
 describe('agent errors', () => {
   it('are all AgentErrors with a code from the worker-side namespace', () => {
@@ -36,20 +56,26 @@ describe('agent errors', () => {
     }
   });
 
-  it('are all labelled not retryable, because a pure function fails the same way twice', () => {
-    for (const error of ALL) {
-      expect(error.retryable).toBe(false);
-    }
-  });
-
   it('carry their own class name, so a log line says what happened', () => {
     expect(ALL.map((error) => error.name)).toEqual([
       'IncompleteEvaluationError',
+      'SummaryContainsScoreError',
       'DuplicateRatingError',
       'InvalidRatingError',
       'InvalidRoleError',
       'UnknownRuleTypeError',
     ]);
+  });
+
+  it('are every error class this module exports, so the sets below are exhaustive', () => {
+    // Without this, "the retryable set is exactly these two" would only be a
+    // claim about the errors somebody remembered to list. A new class added to
+    // the module and to neither set fails here first.
+    const exported = Object.keys(errorsModule)
+      .filter((name) => name !== 'AgentError')
+      .sort();
+
+    expect([...new Set(ALL.map((error) => error.name))].sort()).toEqual(exported);
   });
 
   describe('toJSON', () => {
@@ -60,7 +86,7 @@ describe('agent errors', () => {
         name: 'IncompleteEvaluationError',
         code: 'AGENT_INCOMPLETE_EVAL',
         message: 'evaluation is missing a rating for 1 criterion/criteria: c-a',
-        retryable: false,
+        retryable: true,
         details: { missingCriterionIds: ['c-a'] },
       });
     });
@@ -105,27 +131,45 @@ describe('agent errors', () => {
     expect(new InvalidRoleError('no criteria').details).toEqual({});
   });
 
-  describe('the one deliberate exception to "nothing here is retryable"', () => {
-    // `ALL` above is every error whose input is fixed: re-running the same pure
-    // function over the same argument fails identically, so retrying is waste.
-    // SummaryContainsScoreError is the exception and is kept out of that list on
-    // purpose - what a retry changes there is the generation, not the argument.
-    // Its behaviour is tested in validate-summary.test.js; what is asserted here
-    // is that the exception is exactly one error wide.
-    const summaryError = new SummaryContainsScoreError({
-      patternId: 'percentage',
-      description: 'a percentage, in symbol or spelled form',
-      match: '80%',
+  describe('the deliberate exceptions to "nothing here is retryable"', () => {
+    // The rule is that a pure function re-run over the same argument fails
+    // identically, so a retry is waste. Both exceptions are the same shape of
+    // exception: what a retry changes for either is the *generation*, not the
+    // argument - the model returned a response that came up short, and asking
+    // again produces a different one. Their behaviour is tested where each is
+    // raised (evaluate-candidate.test.js, validate-summary.test.js); what is
+    // asserted here is that the exception is exactly two errors wide, and which
+    // two.
+    it('is exactly this set, named, and no wider', () => {
+      expect(ALL.filter((error) => error.retryable).map((error) => error.name)).toEqual([
+        'IncompleteEvaluationError',
+        'SummaryContainsScoreError',
+      ]);
     });
 
-    it('is an AgentError with a code from the same namespace', () => {
-      expect(summaryError).toBeInstanceOf(AgentError);
-      expect(summaryError.code).toBe(AGENT_ERROR_CODES.BAD_OUTPUT);
+    it('leaves every other member labelled not retryable', () => {
+      for (const error of NOT_RETRYABLE) {
+        expect(error.retryable, error.name).toBe(false);
+      }
     });
 
-    it('is retryable, and is the only member of the namespace that is', () => {
-      expect(summaryError.retryable).toBe(true);
-      expect(ALL.some((error) => error.retryable)).toBe(false);
+    it('carries codes from the same worker-side namespace as the rest', () => {
+      const [incomplete, summary] = RETRYABLE;
+
+      expect(incomplete).toBeInstanceOf(AgentError);
+      expect(incomplete.code).toBe(AGENT_ERROR_CODES.INCOMPLETE_EVAL);
+      expect(summary).toBeInstanceOf(AgentError);
+      expect(summary.code).toBe(AGENT_ERROR_CODES.BAD_OUTPUT);
+    });
+
+    it('names the exact ids a retry has to fix, and nothing else', () => {
+      // The ids are what make the retry worth spending: a model told which
+      // criteria it dropped usually returns them. They are also all that goes to
+      // the log - no labels, no profile text.
+      const [incomplete] = RETRYABLE;
+
+      expect(incomplete.missingCriterionIds).toEqual(['c-a', 'c-b']);
+      expect(incomplete.details).toEqual({ missingCriterionIds: ['c-a', 'c-b'] });
     });
   });
 });

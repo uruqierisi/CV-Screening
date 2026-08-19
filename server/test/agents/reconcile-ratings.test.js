@@ -101,7 +101,13 @@ describe('reconcileRatings', () => {
       expect(thrown).toBeInstanceOf(IncompleteEvaluationError);
       expect(thrown.missingCriterionIds).toEqual(['c-b', 'c-c']);
       expect(thrown.code).toBe('AGENT_INCOMPLETE_EVAL');
-      expect(thrown.retryable).toBe(false);
+      // Labelled retryable, because what a retry changes is the generation that
+      // produced these ratings rather than this argument. Nothing about *this*
+      // function retries: it refuses the ratings it was handed, every time, and
+      // that refusal is the guarantee for any caller who scores an evaluation
+      // the evaluation call never produced. The recovery lives one layer up, in
+      // `evaluate-candidate.js`, where the model is still in the loop.
+      expect(thrown.retryable).toBe(true);
       expect(thrown.message).toContain('c-b, c-c');
     });
 

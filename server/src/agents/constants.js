@@ -136,16 +136,38 @@ export const EDUCATION_LEVELS = Object.freeze([
 export const EVIDENCE_TYPES = Object.freeze(['demonstrated', 'listed_only']);
 
 /**
- * Worker-side candidate error codes owned by the deterministic core. This is the
- * codes namespace from plan section 5.4, restricted to the codes 2a can raise -
- * they are stored in `candidates.error_code` and returned inside a 200, and are
- * deliberately kept apart from the HTTP error codes.
+ * Worker-side candidate error codes. This is the codes namespace from plan
+ * section 5.4: stored in `candidates.error_code`, returned inside a 200, never
+ * mapped to an HTTP status, and deliberately kept in a different frozen object
+ * from the HTTP error codes so the two cannot be confused.
+ *
+ * The first four are raised by the deterministic core (phase 2a); the rest by
+ * the model-facing layer (phase 2b, `client/errors.js`). They share one map
+ * rather than living in two, because the worker's failure handler reads exactly
+ * one of these off exactly one `AgentError` and should not have to know which
+ * half of the layer threw.
+ *
+ * Two codes from section 5.4 are absent on purpose: `EXTRACTION_FAILED` belongs
+ * to phase 3's document parsing and `SOURCE_FILE_MISSING` to phase 4's storage.
+ * Neither is reachable from the agent layer, and declaring a code nothing can
+ * raise invites somebody to raise it from the wrong place.
+ *
+ * `AGENT_INPUT_TOO_LARGE` is an addition to the list in section 5.4. Context
+ * overflow needs its own code: it is neither bad model output nor an empty
+ * document, and folding it into either would point the reader at the wrong
+ * cause.
  */
 export const AGENT_ERROR_CODES = Object.freeze({
   BAD_OUTPUT: 'AGENT_BAD_OUTPUT',
   INCOMPLETE_EVAL: 'AGENT_INCOMPLETE_EVAL',
   INVALID_ROLE: 'AGENT_INVALID_ROLE',
   UNKNOWN_RULE: 'AGENT_UNKNOWN_RULE',
+  EMPTY_DOCUMENT: 'EMPTY_DOCUMENT',
+  INPUT_TOO_LARGE: 'AGENT_INPUT_TOO_LARGE',
+  TIMEOUT: 'AGENT_TIMEOUT',
+  RATE_LIMIT: 'AGENT_RATE_LIMIT',
+  UPSTREAM: 'AGENT_UPSTREAM',
+  REFUSED: 'AGENT_REFUSED',
 });
 
 /** Months in a year, named so the arithmetic in compute-experience reads. */
