@@ -145,3 +145,120 @@ export function containsNormalized(haystack, needle) {
   }
   return normalizeForMatch(haystack).includes(normalizedNeedle);
 }
+
+/**
+ * The cheapest possible failure - plan section 5.5.
+ *
+ * Ownership is split on purpose. `server/src/extraction/` (phase 3) answers "can
+ * I get text out of this file" and raises `EXTRACTION_FAILED` or
+ * `EMPTY_DOCUMENT`. This answers a different question - "is what came out worth
+ * spending a token on" - and it runs immediately before the first API call, so a
+ * scanned PDF whose text layer yielded three words of page furniture costs
+ * nothing at all.
+ *
+ * The redundancy with phase 3 is intentional. Two cheap checks that overlap are
+ * better than one check in a file somebody might later reorganise.
+ *
+ * This function is a judgement, not a throw: it returns what it found and lets
+ * `extract-profile.js` decide. Keeping it that way means `util/` still imports
+ * nothing, and means a caller that wants to log the statistics without failing
+ * the candidate can.
+ */
+
+/**
+ * The bars a CV has to clear. Set to reject page furniture, not to reject short
+ * CVs: a genuinely thin one-page CV is a candidate a recruiter should get to
+ * see, and rejecting it here would look identical to a parsing bug.
+ */
+export const CV_TEXT_THRESHOLDS = Object.freeze({
+  /** About two sentences. Below this there is nothing to extract from. */
+  MIN_CHARACTERS: 200,
+  /**
+   * Letters as a fraction of non-whitespace characters. A failed text layer
+   * yields punctuation, ligature debris and box-drawing characters; prose does
+   * not. Half is lenient enough for a CV that is mostly dates and bullet glyphs.
+   */
+  MIN_ALPHABETIC_RATIO: 0.5,
+});
+
+/**
+ * Words that mean "this document is a CV". One is enough. The list is
+ * deliberately short and generic - it is a smoke test against a random PDF that
+ * happens to be prose, not a classifier, and every entry added to it is another
+ * chance to reject a real CV that words things differently.
+ */
+const CV_SIGNAL_WORDS = Object.freeze([
+  'experience',
+  'education',
+  'skills',
+  'employment',
+  'qualification',
+  'certification',
+  'curriculum vitae',
+  'resume',
+  'work history',
+  'career',
+  'university',
+  'college',
+  'degree',
+  'project',
+  'responsibilities',
+]);
+
+/** A four-digit year in a plausible range. Almost every CV carries one. */
+const YEAR_PATTERN = /\b(?:19|20)\d{2}\b/;
+
+/** Letters in any script, so a non-English CV is not penalised by this check. */
+const LETTER_PATTERN = /\p{L}/gu;
+
+/**
+ * @typedef {object} CvTextAssessment
+ * @property {boolean} usable
+ * @property {('too_short' | 'not_enough_letters' | 'no_cv_signal')[]} failures
+ * @property {{ characters: number, letters: number, alphabeticRatio: number }} stats
+ *   counts only - safe to log, and containing no span of the document
+ */
+
+/**
+ * Judges whether text is worth an extraction call.
+ *
+ * @param {unknown} text
+ * @returns {CvTextAssessment}
+ */
+export function assessCvText(text) {
+  const value = typeof text === 'string' ? normalizeWhitespace(text) : '';
+  const characters = value.length;
+  const letters = (value.match(LETTER_PATTERN) ?? []).length;
+  const nonWhitespace = value.replace(/\s/g, '').length;
+  // A ratio over an empty document is 0, not NaN: the length check has already
+  // failed it, and NaN in a log line tells a reader nothing.
+  const alphabeticRatio = nonWhitespace === 0 ? 0 : letters / nonWhitespace;
+
+  /** @type {CvTextAssessment['failures']} */
+  const failures = [];
+
+  if (characters < CV_TEXT_THRESHOLDS.MIN_CHARACTERS) {
+    failures.push('too_short');
+  }
+  if (alphabeticRatio < CV_TEXT_THRESHOLDS.MIN_ALPHABETIC_RATIO) {
+    failures.push('not_enough_letters');
+  }
+
+  const lowered = value.toLowerCase();
+  const hasSignal =
+    YEAR_PATTERN.test(lowered) || CV_SIGNAL_WORDS.some((word) => lowered.includes(word));
+  if (!hasSignal) {
+    failures.push('no_cv_signal');
+  }
+
+  return {
+    usable: failures.length === 0,
+    failures,
+    stats: {
+      characters,
+      letters,
+      // One decimal: this is a log line, not a measurement.
+      alphabeticRatio: Math.round(alphabeticRatio * 10) / 10,
+    },
+  };
+}
