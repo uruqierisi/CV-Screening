@@ -116,12 +116,23 @@ reordering path the repository actually uses.
 | `min_years_experience` | `{ years: int 0..60 }` | `computedYearsExperience` | `>=` |
 | `required_skill` | `{ skill, matchMode: 'exact'\|'normalized', mustBeDemonstrated: bool }` | `skills[]` | token match; `mustBeDemonstrated` requires `evidenceType === 'demonstrated'` **after** quote verification |
 | `required_education_level` | `{ level }` | `education[]` | ordered ladder `none < high_school < associate < bachelors < masters < doctorate` |
-| `required_certification` | `{ name, matchMode }` | `certifications[]` | normalized name match |
+| `required_certification` | `{ name, matchMode }` | `certifications[]` | normalized name match, **and not stated-expired** — see below |
 | `location_allowlist` | `{ countryCodes: [ISO-3166-1 alpha-2] }` | `location` | membership |
 
 The union is **closed**: a rule type with no code evaluator cannot be stored, and an unknown
 type at evaluation time **throws** — it never silently passes. A unit test asserts the stored
 enum and the evaluator registry are the same set.
+
+**`required_certification` reads expiry, and this is why `{ now }` exists.** A name match
+alone would let a lapsed licence satisfy a rule that says "current". The seed's own rule —
+*"Current Registered Nurse (RN) licence"* — asks a question a name match cannot answer, so a
+certification whose **stated** `expiryDate` has passed relative to the injected `now` counts
+as **not held**. The asymmetry is deliberate and runs one way only: an absent, null or
+unparseable expiry is **never** treated as expiry, because that would turn an extraction gap
+into a rejection, which is exactly the failure §7-C exists to prevent. `now` is injected
+rather than read from the clock so the evaluation is reproducible; without this predicate it
+would be an unused parameter, since every other time-dependent fact is computed upstream in
+`compute-experience.js`.
 
 `required_language` (proposed by the backend lane) is **dropped** — not in the spec.
 `required_certification` is **in**, because the spec names mandatory certifications explicitly.
@@ -419,8 +430,42 @@ agents/
   `parsed_output === null` with no diagnostic. The same condition caught in
   `reconcile-ratings.js` names the exact missing ids. Put in the schema what the decoder can
   *enforce*; put in code what it can only *reject*.
-- **No score, tier, or "overall" field exists anywhere in the evaluation schema.** There is
-  nowhere for the model to put a number code didn't compute. Absence is the enforcement.
+- **No score, tier, or "overall" _number_ exists anywhere in the evaluation schema.** There is
+  nowhere for the model to put a figure code didn't compute. Absence is the enforcement.
+- **`summary` is prose, and prose only.** The stored `ai_justification` (§2, §3) is 2–3
+  sentences of synthesis. Composing it in code from the per-criterion `reason` strings yields a
+  mechanical concatenation that satisfies the shape and loses the substance, so the model
+  writes it, as `summary: string | null`.
+
+  That does not weaken the rule above, because the rule is about numbers, not about text. The
+  failure it guards against is narrow and concrete: the model writing *"roughly an 80% match"*
+  while `computeWeightedScore` returned 73.4, leaving a recruiter with two contradicting
+  figures and no way to tell which is real. So the number is kept out of the prose at both ends:
+
+  - The evaluation prompt **explicitly forbids** any numeric score, percentage, rating or
+    *x*/10 in the summary.
+  - Post-validation **rejects** a summary that puts a figure on the score itself: a percentage,
+    an *x*/10 or *x*/100 pattern, or a number quantifying the match — *"score of 80"*,
+    *"80% match"*, *"rated 8"*. It deliberately does **not** reject counts. *"matches 4 of the
+    6 criteria"* and *"8 years of experience"* are legitimate sentences, and rejecting them
+    would burn a retry, and real API spend, on a correct summary. A rejected summary is a
+    schema validation failure and takes the normal retry path (§5.4). It is **not** silently
+    stripped — silent repair hides a model that is drifting.
+  - The check runs **after** parsing, in code, not as a `.refine()` — for the same reason the
+    completeness refine is banned above. A refine failure yields `parsed_output === null` with
+    no diagnostic; a post-parse check throws a typed error naming the pattern that matched,
+    onto the identical retry path.
+  - Tests cover each rejected pattern, a clean summary passing, and *"matches 4 of the 6
+    criteria"* explicitly, so the line between a count and a score is documented in the suite
+    rather than implied by a regex.
+
+  Stated once: **prose from the model, numbers only from code, enforced at the boundary.**
+
+  Cost, accepted: the narrow rule lets an oblique paraphrase through — *"about four-fifths of
+  what we're looking for"* states a figure without matching any pattern. That is the deliberate
+  trade. The prompt-level prohibition is the primary control; post-validation is the backstop
+  for the literal forms a drifting model actually produces, and a false rejection is more
+  expensive than a rare oblique one.
 
 **Years of experience:** the model returns only `statedYearsExperience` (what the CV literally
 claims). `compute-experience.js` derives `computedYearsExperience` from work-history dates with
@@ -462,7 +507,7 @@ And the line that makes the evidence work pay off:
 
 ```js
 computeWeightedScore(criteria, ratings)
-  → { score, rawScore, weightSum, breakdown: [{ criterionId, rating, weight, weightedPoints }] }
+  → { score, scoreRaw, weightSum, breakdown: [{ criterionId, rating, weight, weightedPoints }] }
 evaluateEliminationRules(profile, rules, { now })
   → { eliminated, failures[], indeterminate[] }
 assignTier(score, isEliminated) → 'strong_match' | 'potential_match' | 'unmatched'
@@ -696,6 +741,22 @@ README is in §4.
   `(role_id, content_sha256)` but are not prevented.
 - **Ranking worst-first is a backwards scan of a `DESC NULLS LAST` index**, not an index-backed
   ascending order, and is fine at these row counts.
+- **An empty fact list is treated as unknown, not as absence.** A rule whose profile fact is
+  `[]` returns `indeterminate` exactly as `null` does — §7-C fixes the behaviour for a missing
+  fact but not for an empty one, and the two are indistinguishable in practice, since an
+  extraction that found nothing and a CV that lists nothing produce the same empty array.
+  Cost, accepted and stated because it runs against the recruiter's intuition: a candidate who
+  genuinely lists no skills at all is **flagged for review rather than eliminated**, so a
+  `required_skill` rule will not screen out an empty CV on its own.
+
+### A note the README must carry
+
+Not a limitation — a disclosure, and it belongs above the setup instructions rather than
+buried at the end, so a reviewer reads it before forming a theory:
+
+> This project was built with AI assistance under my direction. The architectural decisions are
+> mine — the data model, the split between what the model judges and what code computes, the
+> phase structure, and every trade-off recorded in `docs/PHASE-0-PLAN.md`.
 
 ---
 
