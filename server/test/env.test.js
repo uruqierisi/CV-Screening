@@ -73,6 +73,43 @@ describe('parseEnv', () => {
     expect(result.success).toBe(true);
   });
 
+  it('does not require the Anthropic key, so migrations run without one', () => {
+    // Deliberate. `npm run migrate`, `npm run seed` and the whole phase 2a unit
+    // suite spend no tokens, and a required-but-unused variable would stop a
+    // reviewer running any of them. The place a missing key must be fatal is
+    // where the client is constructed - `createAnthropicClient` throws there.
+    const result = parseEnv({ DATABASE_URL: DEV_URL });
+
+    expect(result.success).toBe(true);
+    expect(result.env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it('treats an empty or whitespace-only key exactly as an absent one', () => {
+    // `.env.example` ships the line empty, and a blank string is not a
+    // credential. Without this, a copied example would produce a client that
+    // authenticates with "" and 401s once per candidate.
+    for (const value of ['', '   ', '\n']) {
+      const result = parseEnv({ DATABASE_URL: DEV_URL, ANTHROPIC_API_KEY: value });
+      expect(result.success).toBe(true);
+      expect(result.env.ANTHROPIC_API_KEY).toBeUndefined();
+    }
+  });
+
+  it('trims a real key and keeps it', () => {
+    const result = parseEnv({ DATABASE_URL: DEV_URL, ANTHROPIC_API_KEY: '  sk-ant-example  ' });
+
+    expect(result.env.ANTHROPIC_API_KEY).toBe('sk-ant-example');
+  });
+
+  it('never names a key value in an error message', () => {
+    // Every issue string is built from a path and a message, so a secret cannot
+    // reach a log line through the startup failure path.
+    const result = parseEnv({ DATABASE_URL: 'mysql://x', ANTHROPIC_API_KEY: 'sk-ant-secret' });
+
+    expect(result.success).toBe(false);
+    expect(result.issues.join('\n')).not.toContain('sk-ant-secret');
+  });
+
   it('freezes the parsed environment so nothing can mutate config at runtime', () => {
     const result = parseEnv({ DATABASE_URL: DEV_URL });
 

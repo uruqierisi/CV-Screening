@@ -7,10 +7,10 @@ import { z } from 'zod';
  * kills the process here rather than surfacing as a confusing runtime failure
  * three layers in.
  *
- * Phase 1 declares only what the data layer actually uses. Later phases extend
- * `baseEnvSchema` in place (Redis URL, Anthropic key, upload root, HTTP port).
- * Keeping the schema minimal means an unused-but-required variable can never
- * block a reviewer from running the migrations.
+ * Phase 1 declared only what the data layer uses; phase 2b adds the Anthropic
+ * key. Later phases extend `baseEnvSchema` in place (Redis URL, upload root,
+ * HTTP port). Keeping the schema minimal means an unused-but-required variable
+ * can never block a reviewer from running the migrations.
  */
 
 const postgresUrl = z
@@ -30,6 +30,25 @@ const baseEnvSchema = z.object({
    */
   TEST_DATABASE_URL: postgresUrl.optional(),
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
+  /**
+   * The Anthropic API key. **Optional here, and required at the point of use.**
+   *
+   * Making it required at import would mean `npm run migrate`, `npm run seed`
+   * and the entire phase 2a unit suite refuse to run on a machine that has no
+   * key - none of which spends a token. The place a missing key must be fatal is
+   * where the client is constructed, which is worker start-up, and
+   * `createAnthropicClient` throws there with a message naming this variable.
+   *
+   * An empty value is the same as an absent one, because `.env.example` ships
+   * the line empty and a blank string is not a credential.
+   */
+  ANTHROPIC_API_KEY: z
+    .string()
+    .optional()
+    .transform((value) => {
+      const trimmed = value === undefined ? '' : value.trim();
+      return trimmed === '' ? undefined : trimmed;
+    }),
 });
 
 const envSchema = baseEnvSchema.superRefine((value, ctx) => {
