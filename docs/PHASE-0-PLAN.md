@@ -296,6 +296,13 @@ evaluationMatrix: {
 }
 ```
 
+**Open contract gap, recorded so Phase 4 does not rediscover it.** `ai_justification` is stored
+(§2) and its source is defined (§5.1 — the model's `summary`, prose only), but no response shape
+in this section carries it: it is absent from the candidate list row and from the detail fields
+above. The detail response is where it belongs — it is per-candidate prose a recruiter reads
+once, not something to ship in a 25-row page. Phase 4 must add it as `aiJustification` to the
+candidate detail payload, or decide deliberately that the field is written and never read.
+
 `weightedPoints = rating × weight`, and `Σ weightedPoints === scoreRaw`. This is what lets the
 detail screen show a **Contribution** column that reconciles exactly to the final score —
 turning the matrix from a list of opinions into an audit trail. `rawText` is excluded unless
@@ -424,8 +431,20 @@ agents/
 - **`skills[].evidenceQuote`** must be a **verbatim** span. `verify-evidence.js` normalizes
   whitespace/case/unicode dashes and substring-matches it against the source; a miss downgrades
   the skill to `listed_only`. It is the only claim in the system a machine can falsify.
-- **`criterionId` is a dynamic `z.enum` of this role's actual ids**, so constrained decoding
-  makes inventing a criterion structurally impossible.
+- **`criterionId` is a dynamic `z.enum` of this role's actual ids.** An earlier draft of this
+  section claimed constrained decoding made inventing a criterion *structurally impossible*.
+  That is an overclaim and is corrected here: the SDK's JSON-Schema transform **demotes `enum`
+  into the field's `description`**, and it does so on the official `zodOutputFormat` path too,
+  so the enum reaches the model as a **decoding hint, not a decoding constraint**.
+
+  What is actually guaranteed: an invented criterion id is **rejected by the zod enum** when the
+  response is parsed, one retry follows with the error fed back, and if the second response is
+  also wrong the candidate **fails**. No invented criterion can reach a score. That is a weaker
+  claim than the original and it is still a good one — the guarantee that matters is that a
+  fabricated criterion cannot be scored, and it holds.
+
+  Recorded rather than quietly fixed because an overclaim in this document is worse than the
+  weaker truth: a reviewer who catches one stops trusting the rest.
 - **No completeness `.refine()`** on the ratings array — a refine failure yields
   `parsed_output === null` with no diagnostic. The same condition caught in
   `reconcile-ratings.js` names the exact missing ids. Put in the schema what the decoder can
@@ -523,10 +542,24 @@ produces identical output.
 **Reconciliation policy:**
 - *Rating for a criterion that no longer exists* → dropped, recorded in `unknownIds`, warned.
   An extra rating cannot corrupt a weighted sum over a fixed criterion set.
-- *Criterion missing from the response* → **hard failure**, `IncompleteEvaluationError` naming
-  the ids. Substituting 0 silently depresses the score; renormalizing silently inflates it.
-  Both are invisible to a recruiter reading the number. A visibly failed candidate is
-  recoverable; a quietly mis-scored one is not.
+- *Criterion missing from the response* → **one retry, then hard failure**,
+  `IncompleteEvaluationError` naming the ids. Substituting 0 silently depresses the score;
+  renormalizing silently inflates it. Both are invisible to a recruiter reading the number. A
+  visibly failed candidate is recoverable; a quietly mis-scored one is not.
+
+  The retry is why this error is labelled `retryable`, which reverses an earlier decision here
+  that made it terminal on the first response. The reasoning: **a missing criterion is a
+  generation failure, so the one thing that can fix it is a different generation.** The earlier
+  rule — re-running a pure function over the same input fails identically — is true of the
+  *argument* and false of the *generation*, which is the same reasoning already applied to a
+  summary that states a score. The costs are asymmetric: one extra call, against discarding a
+  complete evaluation and showing a recruiter a failed candidate.
+
+  The retry happens in the **evaluation call's validation hook**, where the model is still in
+  the loop and can be told which ids it omitted. `reconcile-ratings.js` is unchanged and still
+  refuses an incomplete evaluation on sight — the hook is the recovery, the scorer is the
+  guarantee, and the guarantee still holds for any caller scoring an evaluation that hook never
+  produced.
 - *Duplicate criterionId* → hard failure. No defensible way to pick between two contradictory
   ratings of the same thing.
 
@@ -540,10 +573,53 @@ one golden fixture run 100× asserting byte-identical JSON.
 `new Anthropic({ apiKey, timeout, maxRetries: 2 })` — **TS SDK timeouts are milliseconds**.
 Non-streaming: outputs are schema-bounded and small. Two retry layers:
 
+**No `temperature`, and this is the answer to the variance question.** Checked against the
+Anthropic documentation on **2026-08-19**: `temperature`, `top_p` and `top_k` are **removed on
+this model family** — Opus 5, Opus 4.8, Opus 4.7, Sonnet 5 and Fable 5 — and sending any of
+them returns **400**. Setting `temperature: 0` on the evaluation call is therefore not a tuning
+decision that was skipped; it is a request that fails. Recorded here with the date because it
+is the first thing anyone asks about a system that puts a model in front of a hiring decision,
+and the answer should not live only in a code comment.
+
+What the system does about variance instead, in descending order of how much it actually buys:
+
+1. **The score is not the model's.** `computeWeightedScore` is integer arithmetic over ratings
+   and weights (§5.3) — byte-identical on every run, and a pure function of its inputs. Nothing
+   in the sampler could have made the *arithmetic* less variable, because the arithmetic was
+   never variable.
+2. **Every rating is shown with its evidence.** A recruiter is not asked to trust an 8; they are
+   shown the criterion, the one-sentence reason, and the verbatim span it rests on. Variance
+   that survives is visible rather than hidden inside a number.
+3. **The stored result is not recomputed on read.** Score, tier, matrix and justification are
+   written once when the candidate is screened and served from the row thereafter, so the same
+   candidate does not move between two page loads. §8's caveat about re-running the *pipeline*
+   is a different claim from the dashboard being stable.
+4. **`output_config.effort`** replaces sampling parameters as the depth control: `low` for
+   extraction, `high` for evaluation (§5.2).
+
+Stated honestly: this reduces the blast radius of variance, it does not remove it. The same CV
+screened twice can still produce different ratings and therefore a different score — that
+limitation is §8's, and it is unchanged by anything in this section.
+
 | Layer | Owner | Retries |
 |---|---|---|
 | Transport (408/409/429/5xx/connection) | SDK | 2, exponential, honours `retry-after` |
 | Semantic (validation failure, truncation) | `call-structured.js` | 1 |
+
+**`SEMANTIC_RETRIES = 1` is shared, not additive.** It is one budget for the whole response,
+not one per condition, and every semantic condition draws on the same allowance: a schema
+mismatch, a truncation, a non-JSON body, a summary that states a score, and an evaluation
+missing a criterion. So the obvious question — what happens when the summary is wrong *and* a
+criterion is missing — has one answer: the response is rejected once, both faults are fed back
+in the same correction, and if the second response is still wrong the candidate fails. It never
+costs two retries.
+
+Ordering matters when more than one condition fires. Completeness is checked **before** the
+summary rule, because a response missing two of six ratings has a bigger problem than a
+sentence with a percentage in it, and spending the single retry on the smaller fault would be
+the wrong trade. The consequence, stated plainly: the worst case per model call is unchanged by
+adding conditions, and only a candidate that would previously have failed outright now spends a
+second call.
 
 Worst case is 6 HTTP requests, and the SDK retries timeouts too — so an outer
 `AbortController` enforces a **hard 240s deadline per candidate** regardless of what the retry
@@ -555,7 +631,12 @@ responses. `stop_reason: 'refusal'` is **never** retried.
 
 Worker-side codes stored on the candidate: `EXTRACTION_FAILED`, `EMPTY_DOCUMENT`,
 `AGENT_TIMEOUT`, `AGENT_RATE_LIMIT`, `AGENT_UPSTREAM`, `AGENT_REFUSED`, `AGENT_BAD_OUTPUT`,
-`AGENT_INCOMPLETE_EVAL`, `AGENT_INVALID_ROLE`, `AGENT_UNKNOWN_RULE`, `SOURCE_FILE_MISSING`.
+`AGENT_INCOMPLETE_EVAL`, `AGENT_INPUT_TOO_LARGE`, `AGENT_INVALID_ROLE`, `AGENT_UNKNOWN_RULE`,
+`SOURCE_FILE_MISSING`.
+
+`AGENT_INPUT_TOO_LARGE` was added during phase 2b and is not in the original list: a CV that
+overflows the context window is neither bad output nor an empty document, and collapsing it
+into either would tell a recruiter to fix the wrong thing.
 Each carries a recruiter-safe `userMessage`; `detail` goes to logs and **never contains CV
 text** (asserted by planting a sentinel string in a fixture CV and scanning serialized errors).
 
@@ -748,6 +829,12 @@ README is in §4.
   Cost, accepted and stated because it runs against the recruiter's intuition: a candidate who
   genuinely lists no skills at all is **flagged for review rather than eliminated**, so a
   `required_skill` rule will not screen out an empty CV on its own.
+
+- **The criterion enum is a decoding hint, not a decoding constraint.** The SDK's JSON-Schema
+  transform demotes `enum` into the field `description` — on the official `zodOutputFormat` path
+  as well — so the model is *told* the valid criterion ids rather than *restricted* to them. An
+  invented id is caught by the zod enum on parse, retried once, and then fails the candidate.
+  No invented criterion can reach a score; the enforcement is validation, not decoding.
 
 ### A note the README must carry
 
