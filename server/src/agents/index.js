@@ -6,10 +6,16 @@
  * layout stays ours to change.
  *
  * Phase 2a is the deterministic core: pure functions, hand-written inputs, exact
- * outputs. Nothing reachable from here imports an SDK, a web framework, a
- * database driver or an HTTP client, and a test asserts that. Phase 2b adds the
- * model-facing modules on top of a core that is already proven, and extends this
- * file rather than replacing it.
+ * outputs. Phase 2b adds the model-facing modules on top of it - one call to
+ * extract, one to evaluate, and the pipeline that composes them with the core.
+ *
+ * The layering rule holds across both: nothing here imports a web framework, a
+ * database driver or an HTTP client, and exactly one file
+ * (`client/anthropic-client.js`) imports the Anthropic SDK. A test asserts both.
+ *
+ * The worker needs precisely one function from this file - `screenCandidate` -
+ * and everything else is exported for tests, for the API's `/config` endpoint and
+ * for the day somebody needs one stage without the other.
  */
 
 export {
@@ -87,6 +93,8 @@ export { verifyEvidence } from './extraction/verify-evidence.js';
 
 export { NOOP_LOGGER } from './util/logger.js';
 export {
+  CV_TEXT_THRESHOLDS,
+  assessCvText,
   containsNormalized,
   containsTokenSequence,
   equalsExact,
@@ -94,3 +102,56 @@ export {
   normalizeWhitespace,
   tokenize,
 } from './util/text.js';
+
+/* ------------------------------------------------------------------ phase 2b */
+
+export {
+  ANTHROPIC_ERROR_KINDS,
+  DEFAULT_MAX_RETRIES,
+  DEFAULT_TIMEOUT_MS,
+  MODEL_ID,
+  classifyAnthropicError,
+  createAnthropicClient,
+  retryAfterSeconds,
+  toOutputFormat,
+} from './client/anthropic-client.js';
+
+export { SEMANTIC_RETRIES, callStructured } from './client/call-structured.js';
+
+export {
+  AgentBadOutputError,
+  AgentInputError,
+  AgentInputTooLargeError,
+  AgentRateLimitError,
+  AgentRefusalError,
+  AgentTimeoutError,
+  AgentUpstreamError,
+  AnthropicConfigurationError,
+} from './client/errors.js';
+
+export {
+  noFabricationRule,
+  outputContractRule,
+  retryNotice,
+  summaryMustNotStateAScore,
+} from './prompts/shared-rules.js';
+export { EXTRACTION_PROMPT_VERSION, extractionPrompt } from './prompts/extraction.prompt.js';
+export { EVALUATION_PROMPT_VERSION, evaluationPrompt } from './prompts/evaluation.prompt.js';
+
+export { normalizeProfile } from './extraction/normalize-profile.js';
+export {
+  EXTRACTION_EFFORT,
+  EXTRACTION_MAX_TOKENS,
+  EXTRACTION_TIMEOUT_MS,
+  extractProfile,
+} from './extraction/extract-profile.js';
+
+export { REDACTED_IDENTITY_FIELDS, redactIdentity } from './evaluation/redact-identity.js';
+export {
+  EVALUATION_EFFORT,
+  EVALUATION_MAX_TOKENS,
+  EVALUATION_TIMEOUT_MS,
+  evaluateCandidate,
+} from './evaluation/evaluate-candidate.js';
+
+export { CANDIDATE_DEADLINE_MS, screenCandidate } from './pipeline/screen-candidate.js';
