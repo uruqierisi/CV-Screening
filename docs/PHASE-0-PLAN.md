@@ -103,7 +103,13 @@ A trigger never fires for a role with zero criteria, so zod additionally require
 `id uuid PK` · `role_id uuid NOT NULL FK→roles ON DELETE CASCADE` · `label text NOT NULL` ·
 `type text NOT NULL CHECK (type IN (...))` · `value jsonb NOT NULL` ·
 `on_missing text NOT NULL DEFAULT 'flag' CHECK (on_missing IN ('flag','eliminate'))` ·
-`position integer NOT NULL`.
+`position integer NOT NULL` (unique per role, `DEFERRABLE INITIALLY DEFERRED`).
+
+`position` matches `role_criteria.position` exactly, deferral included. Both tables are
+ordered lists owned by a role, both are rewritten delete-then-insert inside one transaction,
+and both are read back `ORDER BY position` — so a shared position means a display order that
+can differ between two reads of the same role, and a non-deferred constraint would reject the
+reordering path the repository actually uses.
 
 | `type` | `value` | Profile fact | Predicate |
 |---|---|---|---|
@@ -169,11 +175,32 @@ point of showing the work.
 | `(job_id, status)` | `GET /jobs/:id` aggregate — the hot polling query |
 | `(role_id, content_sha256)` | duplicate-CV lookup; **non-unique on purpose** |
 | `(status) WHERE status IN ('pending','parsing','evaluating')` | stuck-candidate sweep |
-| `role_criteria(role_id)`, `role_elimination_rules(role_id)` | FK joins — PG does not auto-index FK columns |
+| `role_elimination_rules(role_id)` | FK join — PG does not auto-index FK columns |
+| `screening_jobs(role_id)` | the `ON DELETE RESTRICT` check PG runs on every role delete |
+
+**`role_criteria(role_id)` is deliberately absent.** It is a strict prefix of both unique
+constraints on that table — `(role_id, label)` and `(role_id, position)` — either of which
+already serves a lookup or an FK check on `role_id` alone. It read nothing the wider indexes
+could not, and cost a write on every criterion change.
 
 **One ordering rule, defined once:** `ORDER BY match_score DESC NULLS LAST, id DESC`, in SQL.
 The agent layer's proposed `compareCandidates` comparator is **cut** — a second ranking
 definition that could disagree with the first is a bug waiting to happen.
+
+### `updated_at`
+
+Maintained by a `BEFORE UPDATE` row trigger on every table that has the column — `roles` and
+`candidates`, and nothing else. Correctness that depends on every future `UPDATE` remembering
+to set a column is a convention, not a design, and the stuck-candidate sweep reads
+`updated_at` to decide what to re-enqueue. The repositories keep their explicit
+`updated_at = now()`: redundant agreement is cheaper to read than a hidden mechanism.
+
+`now()` (transaction start), not `clock_timestamp()`: rows changed by one transaction became
+visible atomically and should carry one timestamp, and it matches the column default and the
+repositories exactly. Cost, accepted: inside a long transaction the value records when the
+transaction began. Two guards — an `UPDATE` that changes nothing leaves the timestamp alone,
+so the idempotent archive stays a true no-op, and an `UPDATE` that sets `updated_at` itself is
+not overruled, so backdating a row remains possible.
 
 ### Redis vs Postgres
 
@@ -664,6 +691,8 @@ README is in §4.
 - **Uploads are not idempotent.** A double-clicked upload button creates duplicate candidates
   and spends the LLM budget twice. Duplicates are detectable after the fact via
   `(role_id, content_sha256)` but are not prevented.
+- **Ranking worst-first is a backwards scan of a `DESC NULLS LAST` index**, not an index-backed
+  ascending order, and is fine at these row counts.
 
 ---
 

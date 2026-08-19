@@ -146,11 +146,86 @@ describe('schema', () => {
 
   it('indexes the foreign key columns PostgreSQL does not index for us', async () => {
     const { rows } = await pool.query(
-      `SELECT tablename, indexname FROM pg_indexes
-        WHERE indexname IN ('role_criteria_role_id_idx', 'role_elimination_rules_role_id_idx')`,
+      `SELECT indexname FROM pg_indexes
+        WHERE indexname IN ('role_elimination_rules_role_id_idx', 'screening_jobs_role_id_idx')
+        ORDER BY indexname`,
     );
 
-    expect(rows).toHaveLength(2);
+    // screening_jobs.role_id is an ON DELETE RESTRICT foreign key, and PostgreSQL
+    // enforces RESTRICT by looking for a referencing row - without this index that
+    // is a sequential scan of every screening job ever created.
+    expect(rows.map((row) => row.indexname)).toEqual([
+      'role_elimination_rules_role_id_idx',
+      'screening_jobs_role_id_idx',
+    ]);
+  });
+
+  it('carries no index that is a strict prefix of another index', async () => {
+    const { rows } = await pool.query(
+      `SELECT indexname FROM pg_indexes WHERE indexname = 'role_criteria_role_id_idx'`,
+    );
+
+    // Dropped in migration 0006: role_criteria(role_id) reads nothing that
+    // (role_id, label) and (role_id, position) cannot serve, and cost a write on
+    // every criterion insert, update and delete.
+    expect(rows).toHaveLength(0);
+  });
+
+  it('defers the elimination-rule position uniqueness, exactly as criteria does', async () => {
+    const { rows } = await pool.query(
+      `SELECT condeferrable, condeferred
+         FROM pg_constraint
+        WHERE conname = 'role_elimination_rules_role_id_position_key'`,
+    );
+
+    // Rules are written delete-then-insert inside one transaction just as criteria
+    // are, so a non-deferred constraint would reject the reordering path.
+    expect(rows[0]).toEqual({ condeferrable: true, condeferred: true });
+  });
+
+  it('maintains updated_at with a BEFORE UPDATE row trigger', async () => {
+    const { rows } = await pool.query(
+      `SELECT event_object_table, action_timing, event_manipulation, action_orientation
+         FROM information_schema.triggers
+        WHERE trigger_name IN ('roles_set_updated_at', 'candidates_set_updated_at')
+        ORDER BY event_object_table`,
+    );
+
+    expect(rows).toEqual([
+      {
+        event_object_table: 'candidates',
+        action_timing: 'BEFORE',
+        event_manipulation: 'UPDATE',
+        action_orientation: 'ROW',
+      },
+      {
+        event_object_table: 'roles',
+        action_timing: 'BEFORE',
+        event_manipulation: 'UPDATE',
+        action_orientation: 'ROW',
+      },
+    ]);
+  });
+
+  it('leaves no table with an updated_at column without that trigger', async () => {
+    const { rows } = await pool.query(
+      `SELECT c.table_name
+         FROM information_schema.columns c
+        WHERE c.table_schema = 'public'
+          AND c.column_name = 'updated_at'
+          AND NOT EXISTS (
+                SELECT 1
+                  FROM information_schema.triggers t
+                 WHERE t.event_object_schema = c.table_schema
+                   AND t.event_object_table = c.table_name
+                   AND t.action_timing = 'BEFORE'
+                   AND t.event_manipulation = 'UPDATE')`,
+    );
+
+    // Phrased as "which tables are missing it" rather than "these two have it", so
+    // a table added in a later phase with an updated_at column and no trigger fails
+    // here rather than silently relying on every future UPDATE remembering.
+    expect(rows).toEqual([]);
   });
 });
 

@@ -154,3 +154,96 @@ describe('listEliminationRulesByRoleIds', () => {
     expect(await listEliminationRulesByRoleIds(pool, [])).toEqual(new Map());
   });
 });
+
+describe('position uniqueness (database layer)', () => {
+  /** PostgreSQL SQLSTATE for unique_violation. */
+  const UNIQUE_VIOLATION = '23505';
+
+  it('rejects two rules of one role sharing a position', async () => {
+    const { role } = await createRole();
+
+    // Position is the display order of an ordered list. Two rules at position 1
+    // means the order between them is whatever the planner felt like, and it can
+    // differ between two reads of the same role.
+    await expect(
+      withTransaction((client) =>
+        replaceEliminationRulesForRole(client, role.id, [
+          { label: 'Five years', type: 'min_years_experience', value: { years: 5 }, position: 1 },
+          { label: 'Two years', type: 'min_years_experience', value: { years: 2 }, position: 1 },
+        ]),
+      ),
+    ).rejects.toMatchObject({
+      code: UNIQUE_VIOLATION,
+      constraint: 'role_elimination_rules_role_id_position_key',
+    });
+  });
+
+  it('allows the same position under two different roles', async () => {
+    const first = await createRole({
+      title: 'First',
+      eliminationRules: [
+        { label: 'Five years', type: 'min_years_experience', value: { years: 5 }, position: 0 },
+      ],
+    });
+    const second = await createRole({
+      title: 'Second',
+      eliminationRules: [
+        { label: 'Two years', type: 'min_years_experience', value: { years: 2 }, position: 0 },
+      ],
+    });
+
+    // The constraint is per role, not global: every role's list starts at 0.
+    expect(first.eliminationRules[0].position).toBe(0);
+    expect(second.eliminationRules[0].position).toBe(0);
+  });
+
+  it('accepts a delete-then-insert reordering inside one transaction', async () => {
+    const { role } = await createRole({ eliminationRules: ONE_OF_EACH_TYPE });
+
+    const reversed = ONE_OF_EACH_TYPE.map((rule, index) => ({
+      ...rule,
+      position: ONE_OF_EACH_TYPE.length - 1 - index,
+    }));
+
+    await expect(
+      withTransaction((client) => replaceEliminationRulesForRole(client, role.id, reversed)),
+    ).resolves.toHaveLength(ONE_OF_EACH_TYPE.length);
+
+    const stored = await listEliminationRulesByRoleId(pool, role.id);
+    expect(stored.map((rule) => rule.label)).toEqual([
+      'Right to work',
+      'RN licence',
+      'Bachelors',
+      'PostgreSQL',
+      'Five years',
+    ]);
+  });
+
+  it('tolerates a mid-transaction collision, resolving it at COMMIT', async () => {
+    const { role } = await createRole({ eliminationRules: ONE_OF_EACH_TYPE.slice(0, 2) });
+    const [first, second] = await listEliminationRulesByRoleId(pool, role.id);
+    const client = await pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      // Swapping two positions by UPDATE passes through a state where both rows
+      // sit at position 1. A non-deferred constraint would throw on this first
+      // statement, and that is the whole reason this one is DEFERRABLE INITIALLY
+      // DEFERRED - same as role_criteria.
+      await expect(
+        client.query('UPDATE role_elimination_rules SET position = 1 WHERE id = $1', [first.id]),
+      ).resolves.toBeDefined();
+      await client.query('UPDATE role_elimination_rules SET position = 0 WHERE id = $1', [
+        second.id,
+      ]);
+
+      await expect(client.query('COMMIT')).resolves.toBeDefined();
+    } finally {
+      client.release();
+    }
+
+    const stored = await listEliminationRulesByRoleId(pool, role.id);
+    expect(stored.map((rule) => rule.label)).toEqual([second.label, first.label]);
+  });
+});
