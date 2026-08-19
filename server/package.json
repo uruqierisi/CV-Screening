@@ -13,6 +13,9 @@
     "migrate:redo": "node --env-file-if-exists=../.env src/scripts/migrate.js redo",
     "seed": "node --env-file-if-exists=../.env src/scripts/seed.js",
     "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:unit:coverage": "vitest run --project unit --coverage",
+    "test:db": "vitest run --project db",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -20,6 +23,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.11",
     "node-pg-migrate": "^9.0.0",
     "vitest": "^4.1.11"
   }
