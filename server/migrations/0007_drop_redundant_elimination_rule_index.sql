@@ -1,0 +1,37 @@
+-- Up Migration
+--
+-- Drop the redundant role_elimination_rules(role_id) index.
+--
+-- This is the second half of a correction migration 0006 started. 0006 dropped
+-- role_criteria_role_id_idx because it was a strict prefix of the unique
+-- constraints already on that table, and in the same change it added
+-- role_elimination_rules_role_id_position_key UNIQUE (role_id, position). That
+-- addition made the identical argument true here, which the 0006 handoff flagged
+-- as owed follow-up rather than smuggling into an already-batched review.
+--
+-- The argument, restated so it does not have to be reconstructed from 0006:
+-- role_elimination_rules_role_id_idx indexes (role_id). The unique constraint's
+-- index covers (role_id, position) - same leading column, same opclass, same sort
+-- direction. Any lookup or foreign-key check on role_id alone is served by
+-- scanning the leading column of the wider index; the narrow one reads nothing the
+-- wider one cannot, and costs a write on every insert and delete of a rule. Rules
+-- are written delete-then-insert on every role replacement, so that write is not
+-- hypothetical.
+--
+-- Not affected: the ON DELETE CASCADE from roles still finds its referencing rows
+-- through the wider index, exactly as role_criteria's cascade has since 0006.
+--
+-- Locking: DROP INDEX takes ACCESS EXCLUSIVE on role_elimination_rules for the
+-- duration. The runner wraps the whole history in one transaction so CONCURRENTLY
+-- is not available, but the table holds a handful of rows per role and dropping an
+-- index is a catalogue update, not a table rewrite - milliseconds.
+DROP INDEX role_elimination_rules_role_id_idx;
+
+-- Down Migration
+--
+-- Recreated exactly as migration 0003 declared it, so a database rolled back to
+-- 0006 is indistinguishable from one that never ran 0007. That matters more than
+-- usual here: the schema invariant test asserts the absence of any strict-prefix
+-- index, and rolling back must genuinely restore the violation rather than leave a
+-- half-reverted schema that happens to still pass.
+CREATE INDEX role_elimination_rules_role_id_idx ON role_elimination_rules (role_id);

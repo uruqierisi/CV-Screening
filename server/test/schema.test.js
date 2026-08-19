@@ -144,7 +144,7 @@ describe('schema', () => {
     expect(rows[0].indexdef).not.toContain('UNIQUE');
   });
 
-  it('indexes the foreign key columns PostgreSQL does not index for us', async () => {
+  it('indexes the one foreign key column PostgreSQL does not index for us', async () => {
     const { rows } = await pool.query(
       `SELECT indexname FROM pg_indexes
         WHERE indexname IN ('role_elimination_rules_role_id_idx', 'screening_jobs_role_id_idx')
@@ -154,21 +154,97 @@ describe('schema', () => {
     // screening_jobs.role_id is an ON DELETE RESTRICT foreign key, and PostgreSQL
     // enforces RESTRICT by looking for a referencing row - without this index that
     // is a sequential scan of every screening job ever created.
-    expect(rows.map((row) => row.indexname)).toEqual([
-      'role_elimination_rules_role_id_idx',
-      'screening_jobs_role_id_idx',
-    ]);
+    //
+    // role_elimination_rules_role_id_idx is deliberately absent, and is still named
+    // in the query so this asserts its absence rather than quietly forgetting it.
+    // Its ON DELETE CASCADE is served by the leading column of
+    // role_elimination_rules_role_id_position_key; migration 0007 dropped the
+    // standalone index as a strict prefix of that one.
+    expect(rows.map((row) => row.indexname)).toEqual(['screening_jobs_role_id_idx']);
   });
 
+  // Redundant here means: the narrower index reads nothing the wider one cannot, so
+  // it is pure write cost on every insert, update and delete. Two such indexes have
+  // already been dropped on that argument - role_criteria(role_id) in migration 0006
+  // and role_elimination_rules(role_id) in 0007 - so this asserts the invariant
+  // across the whole catalogue rather than naming the two known cases, and keeps
+  // holding as tables are added in later phases.
+  //
+  // Three exclusions are encoded in the query and none of them is an oversight:
+  //
+  //   * The non-unique filter is on the REDUNDANT candidate, not on the pair. A
+  //     unique (a) is NOT redundant against a unique (a, b): unique (a) enforces one
+  //     row per a, which unique (a, b) does not. Dropping it would change what the
+  //     database permits, not merely what it can read. A non-unique prefix carries
+  //     no such semantics, so it is free to go. The wider index may be either.
+  //   * Partial indexes are excluded on both sides. Two indexes with different
+  //     WHERE clauses cover different subsets of rows, so neither can stand in for
+  //     the other whatever their key columns say.
+  //   * Key columns must agree on operator class, sort direction and NULLS ordering,
+  //     not just on column order. A different opclass answers different operators,
+  //     and a prefix ordered differently cannot supply the wider index's ordering.
+  //     Expression indexes are excluded on both sides for the same reason opclasses
+  //     matter: indkey reports 0 for an expression, so two unrelated expressions on
+  //     one table would compare equal.
+  //
+  // Read from pg_index, not by parsing indexdef. A string comparison over DDL text
+  // is a re-implementation of the parser and gets DESC, NULLS FIRST and opclasses
+  // wrong. Only the first indnkeyatts entries are compared, so adding an INCLUDE
+  // column to an index later does not change the answer.
   it('carries no index that is a strict prefix of another index', async () => {
     const { rows } = await pool.query(
-      `SELECT indexname FROM pg_indexes WHERE indexname = 'role_criteria_role_id_idx'`,
+      `WITH idx AS (
+         SELECT
+           i.indexrelid,
+           i.indrelid,
+           tc.relname AS table_name,
+           ic.relname AS index_name,
+           i.indisunique,
+           i.indnkeyatts,
+           i.indpred  IS NOT NULL AS is_partial,
+           i.indexprs IS NOT NULL AS is_expression,
+           -- One token per key column: attribute number, operator class, and the
+           -- packed DESC/NULLS FIRST flags. Equality of these arrays is exactly
+           -- "the same key, indexed the same way". indkey, indclass and indoption
+           -- are 0-based vectors; indnkeyatts excludes INCLUDE columns.
+           (SELECT array_agg(i.indkey[k] || ':' || i.indclass[k] || ':' || i.indoption[k]
+                             ORDER BY k)
+              FROM generate_series(0, i.indnkeyatts - 1) AS k) AS key_signature
+         FROM pg_index i
+         JOIN pg_class ic ON ic.oid = i.indexrelid
+         JOIN pg_class tc ON tc.oid = i.indrelid
+         JOIN pg_am    am ON am.oid = ic.relam
+         JOIN pg_namespace n ON n.oid = tc.relnamespace
+        WHERE n.nspname = 'public'
+          -- Prefix reasoning is a btree property. A hash or GIN index on the same
+          -- leading column answers different queries entirely.
+          AND am.amname = 'btree'
+       )
+       SELECT redundant.index_name AS redundant,
+              wider.index_name     AS wider,
+              redundant.table_name AS table_name
+         FROM idx AS redundant
+         JOIN idx AS wider
+           ON wider.indrelid = redundant.indrelid
+          AND wider.indexrelid <> redundant.indexrelid
+          -- Strict: equal key counts are the same index, not a prefix of one.
+          AND wider.indnkeyatts > redundant.indnkeyatts
+          AND wider.key_signature[1:redundant.indnkeyatts] = redundant.key_signature
+        WHERE NOT redundant.indisunique
+          AND NOT redundant.is_partial
+          AND NOT wider.is_partial
+          AND NOT redundant.is_expression
+          AND NOT wider.is_expression
+        ORDER BY redundant.table_name, redundant.index_name, wider.index_name`,
     );
 
-    // Dropped in migration 0006: role_criteria(role_id) reads nothing that
-    // (role_id, label) and (role_id, position) cannot serve, and cost a write on
-    // every criterion insert, update and delete.
-    expect(rows).toHaveLength(0);
+    // Compared as sentences rather than as a count, so a failure names the pair and
+    // the table instead of reporting that some boolean was not what it should be.
+    expect(
+      rows.map(
+        (row) => `${row.redundant} is a strict prefix of ${row.wider} on ${row.table_name}`,
+      ),
+    ).toEqual([]);
   });
 
   it('defers the elimination-rule position uniqueness, exactly as criteria does', async () => {

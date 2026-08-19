@@ -175,13 +175,16 @@ point of showing the work.
 | `(job_id, status)` | `GET /jobs/:id` aggregate — the hot polling query |
 | `(role_id, content_sha256)` | duplicate-CV lookup; **non-unique on purpose** |
 | `(status) WHERE status IN ('pending','parsing','evaluating')` | stuck-candidate sweep |
-| `role_elimination_rules(role_id)` | FK join — PG does not auto-index FK columns |
 | `screening_jobs(role_id)` | the `ON DELETE RESTRICT` check PG runs on every role delete |
 
-**`role_criteria(role_id)` is deliberately absent.** It is a strict prefix of both unique
-constraints on that table — `(role_id, label)` and `(role_id, position)` — either of which
-already serves a lookup or an FK check on `role_id` alone. It read nothing the wider indexes
-could not, and cost a write on every criterion change.
+**`role_criteria(role_id)` and `role_elimination_rules(role_id)` are deliberately absent.**
+Each is a strict prefix of a unique constraint already on its own table — `(role_id, label)`
+and `(role_id, position)` on `role_criteria`, `(role_id, position)` on
+`role_elimination_rules` — any of which already serves a lookup, a cascade or an FK check on
+`role_id` alone. They read nothing the wider indexes could not, and cost a write on every
+change to a list that is rewritten delete-then-insert on every role edit. The argument is the
+same one twice, so neither is a candidate for re-adding: a schema test asserts catalogue-wide
+that no non-unique btree index is a strict prefix of another.
 
 **One ordering rule, defined once:** `ORDER BY match_score DESC NULLS LAST, id DESC`, in SQL.
 The agent layer's proposed `compareCandidates` comparator is **cut** — a second ranking
