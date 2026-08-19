@@ -35,6 +35,14 @@ export default defineConfig({
           name: 'unit',
           environment: 'node',
           include: ['test/agents/**/*.test.js'],
+          // The tripwire. Phase 2b brought an SDK into the repository, so "no
+          // test performs a network call" stopped being self-evident and became
+          // something to enforce. `test/agents/network-tripwire.test.js` proves
+          // it fires - a tripwire nobody has seen fail is not a tripwire.
+          //
+          // The `db` project deliberately does not get this: it talks to a real
+          // Postgres, and guarding it would be theatre.
+          setupFiles: ['./test/setup/no-network.js'],
         },
       },
       {
