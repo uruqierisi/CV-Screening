@@ -1,0 +1,47 @@
+# Backing services only. The API and the worker run on the host (`npm run dev`),
+# so a reviewer edits code without rebuilding an image.
+#
+# Host ports are parameterised because 5432/6379 are commonly already in use on a
+# developer machine; the defaults here deliberately avoid the standard ports.
+# Change POSTGRES_HOST_PORT / REDIS_HOST_PORT in .env if these clash too.
+services:
+  postgres:
+    image: postgres:16
+    container_name: cv-screening-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cvscreening}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cvscreening}
+      POSTGRES_DB: ${POSTGRES_DB:-cv_screening}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5442}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Without a healthcheck `docker compose up -d` returns before Postgres accepts
+      # connections, and the first `npm run migrate` races it.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cvscreening} -d ${POSTGRES_DB:-cv_screening}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Unused in Phase 1. Present so the compose file does not churn when the queue
+  # lands in Phase 4 (plan of record, section 1).
+  redis:
+    image: redis:7
+    container_name: cv-screening-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_HOST_PORT:-6389}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres-data:
+  redis-data:

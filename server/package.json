@@ -1,0 +1,26 @@
+{
+  "name": "cv-screening-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "description": "AI CV Screening & Applicant Ranking System - server. Phase 1: data layer.",
+  "scripts": {
+    "migrate": "node --env-file-if-exists=../.env src/scripts/migrate.js up",
+    "migrate:down": "node --env-file-if-exists=../.env src/scripts/migrate.js down",
+    "migrate:redo": "node --env-file-if-exists=../.env src/scripts/migrate.js redo",
+    "seed": "node --env-file-if-exists=../.env src/scripts/seed.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "node-pg-migrate": "^9.0.0",
+    "vitest": "^4.1.11"
+  }
+}
