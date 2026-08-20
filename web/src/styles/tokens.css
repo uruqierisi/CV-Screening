@@ -1,0 +1,110 @@
+/*
+ * Design tokens, the reset, and the type scale.
+ *
+ * Plain CSS with custom properties, no component library and no utility
+ * framework. This app needs about eight primitives, has no combobox, menu or
+ * modal, and a kit's cost - generated markup to defend, or 90kb and a marketing
+ * design language to fight - exceeds its benefit at this size.
+ *
+ * Two rules run through all of it:
+ *   1. Nothing is conveyed by colour alone. Every tier, status and warning
+ *      carries a glyph or a word as well.
+ *   2. Focus is always visible. `:focus-visible` is styled up, never off.
+ */
+
+:root {
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+
+  --radius: 6px;
+  --radius-sm: 4px;
+
+  --ink: #16191d;
+  --ink-soft: #4a525c;
+  --ink-faint: #6d7681;
+  --line: #d9dee4;
+  --line-soft: #e9edf1;
+  --surface: #ffffff;
+  --surface-sunk: #f5f7f9;
+  --surface-raised: #ffffff;
+
+  --accent: #1f4fd8;
+  --accent-ink: #ffffff;
+  --accent-soft: #eef2fe;
+
+  --strong: #0f7a4a;
+  --strong-soft: #e7f5ee;
+  --potential: #9a6100;
+  --potential-soft: #fdf2df;
+  --unmatched: #6d7681;
+  --unmatched-soft: #eef0f3;
+
+  --danger: #b3261e;
+  --danger-soft: #fdecea;
+  --warn: #8a5b00;
+  --warn-soft: #fdf4e3;
+
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  font-size: var(--text-base);
+  line-height: 1.55;
+  color: var(--ink);
+  background: var(--surface-sunk);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0 0 var(--space-3);
+  line-height: 1.25;
+  font-weight: 650;
+}
+
+h1 {
+  font-size: var(--text-2xl);
+}
+h2 {
+  font-size: var(--text-xl);
+}
+h3 {
+  font-size: var(--text-lg);
+}
+h4 {
+  font-size: var(--text-base);
+}
+
+p {
+  margin: 0 0 var(--space-3);
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
