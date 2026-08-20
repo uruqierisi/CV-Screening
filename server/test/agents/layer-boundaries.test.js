@@ -182,9 +182,18 @@ describe('the agent layer imports nothing it should not', () => {
     //   pino                 fastify's own logger, imported directly by the
     //                        worker, which has no fastify instance to borrow one
     //                        from
+    //
+    // Phase 5 added one:
+    //
+    //   @fastify/cors        the CORS allowlist, registered in `app.js` before
+    //                        the routes. Hand-rolling preflight, `Vary: Origin`
+    //                        and the allow-headers negotiation is a spec to
+    //                        re-implement, not four lines saved - and getting it
+    //                        subtly wrong is a security bug rather than a bug.
     const pkg = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8'));
     expect(Object.keys(pkg.dependencies).sort()).toEqual([
       '@anthropic-ai/sdk',
+      '@fastify/cors',
       '@fastify/multipart',
       '@fastify/rate-limit',
       'bullmq',
@@ -198,13 +207,15 @@ describe('the agent layer imports nothing it should not', () => {
     ]);
   });
 
-  it('keeps every phase 4 dependency out of the two framework-agnostic layers', () => {
+  it('keeps every web and queue dependency out of the two framework-agnostic layers', () => {
     // The rule the plan states in section 0 and section 5: `src/agents/` imports
     // no web framework and no DB driver, and `src/extraction/` is the same shape.
-    // Six packages arrived in phase 4 and not one of them may cross either line -
-    // the worker composes these layers, it does not let them learn about a queue.
+    // Six packages arrived in phase 4 and `@fastify/cors` in phase 5; not one of
+    // them may cross either line - the worker composes these layers, it does not
+    // let them learn about a queue or an Origin header.
     const phase4 = [
       'fastify',
+      '@fastify/cors',
       '@fastify/multipart',
       '@fastify/rate-limit',
       'bullmq',

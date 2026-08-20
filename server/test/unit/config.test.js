@@ -221,3 +221,57 @@ describe('enqueue job ids', () => {
     expect(queue.added).toHaveLength(0);
   });
 });
+
+describe('CORS_ALLOWED_ORIGINS - the allowlist', () => {
+  it('defaults to the Vite dev server origin, and not to a wildcard', () => {
+    // `web/vite.config.js` pins the dev server to 5173. The default matters more
+    // than the value: a `*` default would mean this variable never has to be set
+    // and never fails, so a deployment serving the UI from another origin would
+    // discover the omission only when a user reported that nothing loads.
+    // Defaulting to the development origin makes that deployment fail on its
+    // first cross-origin request instead, which is a failure the person
+    // deploying sees.
+    expect(parse().CORS_ALLOWED_ORIGINS).toEqual(['http://localhost:5173']);
+  });
+
+  it('splits and trims a comma-separated allowlist', () => {
+    expect(
+      parse({ CORS_ALLOWED_ORIGINS: 'https://app.example.com , https://admin.example.com' })
+        .CORS_ALLOWED_ORIGINS,
+    ).toEqual(['https://app.example.com', 'https://admin.example.com']);
+  });
+
+  it('refuses a wildcard, by name, at startup', () => {
+    // Not silently ignored and not quietly honoured. `*` is a legitimate CORS
+    // value and an illegitimate one here, so the process has to say so rather
+    // than start with a policy nobody chose.
+    const result = parseEnv({ ...BASE, CORS_ALLOWED_ORIGINS: '*' });
+
+    expect(result.success).toBe(false);
+    expect(result.issues.join('\n')).toContain('CORS_ALLOWED_ORIGINS');
+  });
+
+  it('refuses anything that is not a bare origin', () => {
+    // A browser sends `Origin: https://app.example.com` - no path, no trailing
+    // slash. An allowlist entry carrying either matches nothing, and the symptom
+    // is every request failing with no clue as to why, so it is rejected here.
+    for (const value of [
+      'https://app.example.com/',
+      'https://app.example.com/api',
+      'app.example.com',
+      'not a url',
+      '',
+    ]) {
+      expect(parseEnv({ ...BASE, CORS_ALLOWED_ORIGINS: value }).success, value).toBe(false);
+    }
+  });
+
+  it('accepts an origin with an explicit port and one without', () => {
+    expect(parse({ CORS_ALLOWED_ORIGINS: 'http://localhost:4173' }).CORS_ALLOWED_ORIGINS).toEqual([
+      'http://localhost:4173',
+    ]);
+    expect(parse({ CORS_ALLOWED_ORIGINS: 'https://cv.example.com' }).CORS_ALLOWED_ORIGINS).toEqual([
+      'https://cv.example.com',
+    ]);
+  });
+});

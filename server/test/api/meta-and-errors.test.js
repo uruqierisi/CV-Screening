@@ -62,6 +62,36 @@ describe('GET /api/v1/config', () => {
     }
   });
 
+  it('publishes the candidate statuses AND which of them a poll stops on', async () => {
+    const config = (await app.inject({ method: 'GET', url: '/api/v1/config' })).json().data;
+
+    expect(config.candidates.statuses).toEqual([
+      'pending',
+      'parsing',
+      'evaluating',
+      'done',
+      'failed',
+    ]);
+    // The stop condition, published rather than restated in the client. Without
+    // it a dashboard has to carry its own ['done','failed'], and a stop
+    // condition kept in two places is the one constant that must not drift: one
+    // copy behind means a poll that never stops.
+    expect(config.candidates.terminalStatuses).toEqual(['done', 'failed']);
+  });
+
+  it('derives terminalStatuses from the status list rather than repeating it', async () => {
+    const config = (await app.inject({ method: 'GET', url: '/api/v1/config' })).json().data;
+    const { statuses, terminalStatuses } = config.candidates;
+
+    // Asserted as a relationship, not as a literal: every terminal status is one
+    // of the published statuses, and the terminal list is a subset in the same
+    // order. A second hand-written literal could satisfy the previous test and
+    // still fail this one the day a status is added.
+    expect(terminalStatuses.every((status) => statuses.includes(status))).toBe(true);
+    expect(terminalStatuses).toEqual(statuses.filter((s) => terminalStatuses.includes(s)));
+    expect(terminalStatuses.length).toBeLessThan(statuses.length);
+  });
+
   it('publishes the job statuses a client polls against', async () => {
     const config = (await app.inject({ method: 'GET', url: '/api/v1/config' })).json().data;
     expect(config.jobs.statuses).toEqual([
@@ -178,5 +208,96 @@ describe('upload rate limiting', () => {
     expect(last.statusCode).toBe(429);
     expect(last.json().error.code).toBe('RATE_LIMITED');
     expect(last.headers['retry-after']).toBeDefined();
+  });
+});
+
+describe('CORS', () => {
+  /**
+   * The allowed origin for this run. It comes from the parsed environment rather
+   * than from a literal, so the test is asserting the plugin honours the
+   * allowlist rather than asserting a port number twice.
+   */
+  const allowed = env.CORS_ALLOWED_ORIGINS[0];
+
+  it('defaults the allowlist to the Vite dev server origin', () => {
+    // `web/vite.config.js` pins the dev server to 5173. Until now the client
+    // worked only because that dev server proxied /api and the browser never
+    // made a cross-origin request - which is a property of the dev server, not
+    // of this API.
+    expect(env.CORS_ALLOWED_ORIGINS).toContain('http://localhost:5173');
+  });
+
+  it('answers a preflight from an allowed origin', async () => {
+    const response = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/v1/candidates',
+      headers: {
+        origin: allowed,
+        'access-control-request-method': 'GET',
+      },
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(response.headers['access-control-allow-origin']).toBe(allowed);
+    expect(response.headers['access-control-allow-methods']).toContain('GET');
+  });
+
+  it('echoes the allowed origin on an ordinary request, and varies on it', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/config',
+      headers: { origin: allowed },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['access-control-allow-origin']).toBe(allowed);
+    // Without `Vary: Origin` a shared cache can hand one origin's response,
+    // headers included, to a different origin.
+    expect(String(response.headers.vary)).toContain('Origin');
+  });
+
+  it('sends no allow-origin header to an origin that is not on the list', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/config',
+      headers: { origin: 'https://evil.example.com' },
+    });
+
+    // The request still executes - CORS is enforced by the browser, not by the
+    // server refusing to answer - but the browser is told nothing that would let
+    // it hand the body to that page. This is what `*` would have thrown away.
+    expect(response.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
+  it('does not allow credentials, because there is no auth to carry', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/config',
+      headers: { origin: allowed },
+    });
+
+    // Turning this on would grant a permission nothing uses, and it is mutually
+    // exclusive with the `*` this deliberately is not.
+    expect(response.headers['access-control-allow-credentials']).toBeUndefined();
+  });
+
+  it('exposes the headers the 429 contract documents', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/config',
+      headers: { origin: allowed },
+    });
+
+    // `Retry-After` is not a CORS-safelisted response header. Without this a
+    // cross-origin client can see the 429 and not the header telling it when to
+    // come back, which makes the rate limit unimplementable on the client side.
+    expect(String(response.headers['access-control-expose-headers'])).toContain('retry-after');
+  });
+
+  it('leaves a same-origin request untouched', async () => {
+    const response = await app.inject({ method: 'GET', url: '/api/v1/config' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['access-control-allow-origin']).toBeUndefined();
   });
 });

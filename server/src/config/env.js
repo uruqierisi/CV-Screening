@@ -9,7 +9,7 @@ import { z } from 'zod';
  *
  * Phase 1 declared only what the data layer uses; phase 2b added the Anthropic
  * key; phase 4 adds the HTTP server, the upload limits, the queue and the
- * concurrency dial. Everything phase 4 added carries a default, deliberately: a
+ * concurrency dial; phase 5 adds the CORS allowlist. Everything phase 4 added carries a default, deliberately: a
  * reviewer who copies `.env.example` and starts Docker gets a working system,
  * and an unused-but-required variable can never block `npm run migrate`.
  *
@@ -25,6 +25,29 @@ const postgresUrl = z
     (value) => value.startsWith('postgres://') || value.startsWith('postgresql://'),
     { message: 'must be a postgres:// or postgresql:// connection string' },
   );
+
+/**
+ * A bare HTTP origin: scheme, host and optional port, and nothing else.
+ *
+ * `z.string().url()` is not enough here. It accepts `http://localhost:5173/api`
+ * and `http://localhost:5173/`, neither of which a browser ever sends as an
+ * `Origin` header - so an allowlist built from one would silently match nothing
+ * and every cross-origin request would fail with no clue as to why. Comparing
+ * against `new URL(value).origin` rejects both at startup, by name.
+ */
+const httpOrigin = z.string().refine(
+  (value) => {
+    try {
+      return new URL(value).origin === value;
+    } catch {
+      return false;
+    }
+  },
+  {
+    message:
+      'must be a bare origin - scheme, host and optional port, no path and no trailing slash (e.g. http://localhost:5173)',
+  },
+);
 
 const baseEnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -157,6 +180,45 @@ const baseEnvSchema = z.object({
    * and this module is imported by `npm run migrate`.
    */
   STUCK_CANDIDATE_AGE_MS: z.coerce.number().int().min(300_000).default(900_000),
+
+  /* ------------------------------------------------------------ phase 5 */
+
+  /**
+   * **The CORS allowlist**, comma-separated. Read by `app.js` and by nothing
+   * else.
+   *
+   * It exists because until now the browser client only worked through Vite's
+   * dev-server proxy, and "it works because of a dev-server proxy" is not an
+   * answer for anybody deploying this: the moment the API and the UI are served
+   * from two origins, every request fails preflight and the API is the thing
+   * that is wrong.
+   *
+   * **The default is the development origin, and it is deliberately not `*`.**
+   * `*` would make this variable optional forever - the API would work
+   * everywhere, including from any page on the internet, and nobody would ever
+   * discover they had not configured it. With a dev-origin default, a
+   * production deployment that forgets this variable fails immediately and
+   * visibly on the first cross-origin request, which is the failure worth
+   * having. (`*` is also incompatible with credentialed requests, so choosing it
+   * now would foreclose auth later; that is the second reason, not the first.)
+   *
+   * `http://localhost:5173` is Vite's default and is what `web/vite.config.js`
+   * pins its dev server to.
+   *
+   * A literal `*` here does not disable the allowlist - it fails `httpOrigin`
+   * and stops the process, which is the same loud failure by another route.
+   */
+  CORS_ALLOWED_ORIGINS: z
+    .string()
+    .min(1)
+    .default('http://localhost:5173')
+    .transform((value) =>
+      value
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter((origin) => origin.length > 0),
+    )
+    .pipe(z.array(httpOrigin).min(1)),
 });
 
 const envSchema = baseEnvSchema.superRefine((value, ctx) => {

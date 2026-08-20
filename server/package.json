@@ -26,6 +26,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
+    "@fastify/cors": "^11.3.0",
     "@fastify/multipart": "^10.1.1",
     "@fastify/rate-limit": "^11.2.0",
     "bullmq": "^6.1.2",
