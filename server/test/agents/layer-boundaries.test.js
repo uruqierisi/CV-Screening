@@ -158,10 +158,21 @@ describe('the agent layer imports nothing it should not', () => {
   });
 
   it('declares its dependencies, and nothing it does not use', () => {
+    // A whole-repository check that lives here because this is where the
+    // dependency discipline is written down. It is supposed to fail when a
+    // package is added - that is the point - and each entry has to be worth a
+    // line of justification.
+    //
+    // `unpdf` was added in phase 3 and is not the agent layer's: it is the PDF
+    // text extractor, confined to `src/extraction/parsers/pdf.js`, and
+    // `test/extraction/boundaries.test.js` asserts that confinement. It is
+    // named here rather than exempted because a manifest check that ignores
+    // half the manifest checks nothing.
     const pkg = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8'));
     expect(Object.keys(pkg.dependencies).sort()).toEqual([
       '@anthropic-ai/sdk',
       'pg',
+      'unpdf',
       'zod',
       'zod-to-json-schema',
     ]);
