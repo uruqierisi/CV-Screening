@@ -111,12 +111,20 @@ export function scoreCandidate({ role, profile, evaluation, now, logger }) {
       }),
       computedAt: timestamp,
     },
+    // Stored verbatim in `candidates.elimination_details` (jsonb) and read by the
+    // candidate detail view. `results` carries every rule with its `outcome`, so
+    // an unchecked requirement is distinguishable from a satisfied one rather
+    // than collapsing into "not eliminated" - which is the whole point of 7-C's
+    // third outcome. `indeterminate` is the same rows pre-filtered, and
+    // `hasIndeterminate` is the one key a row badge needs without walking the
+    // blob. Both are derived rather than authoritative; `results` is the record.
     eliminationDetails: {
       eliminated: elimination.eliminated,
       eliminatedBy: elimination.eliminatedBy,
       results: elimination.results,
       failures: elimination.failures,
       indeterminate: elimination.indeterminate,
+      hasIndeterminate: elimination.indeterminate.length > 0,
       evaluatedAt: timestamp,
     },
   };

@@ -178,6 +178,61 @@ describe('scoreCandidate', () => {
     );
   });
 
+  describe('experience the dates do not determine', () => {
+    /**
+     * The same candidate with the end date of her *previous* role lost in
+     * extraction. It is not the latest role on the CV, so its absent end date is
+     * a gap rather than "still there", and the years become unknown - which the
+     * stored result has to carry all the way to the detail view.
+     */
+    const lostEndDate = deepFreeze({
+      ...GOLDEN_PROFILE,
+      workHistory: [
+        GOLDEN_PROFILE.workHistory[0],
+        { ...GOLDEN_PROFILE.workHistory[1], endDate: null },
+      ],
+      computedYearsExperience: null,
+    });
+
+    it('keeps the candidate and badges the requirement as unchecked', () => {
+      const result = scoreGolden({ profile: lostEndDate });
+
+      expect(result.eliminated).toBe(false);
+      expect(result.score).toBe(GOLDEN_EXPECTED.score);
+      expect(result.fitCategory).toBe(GOLDEN_EXPECTED.fitCategory);
+    });
+
+    it('stores an indeterminate rule as its own outcome, not as a pass', () => {
+      // The failure this asserts against is silence: an unchecked requirement
+      // that renders identically to a satisfied one.
+      const { eliminationDetails } = scoreGolden({ profile: lostEndDate });
+
+      expect(eliminationDetails.results.map((result) => result.outcome)).toEqual([
+        'indeterminate',
+        'pass',
+        'pass',
+      ]);
+      expect(eliminationDetails.hasIndeterminate).toBe(true);
+      expect(eliminationDetails.indeterminate).toHaveLength(1);
+      expect(eliminationDetails.indeterminate[0].ruleId).toBe('r-years');
+    });
+
+    it('carries the reason, naming the entry, into the stored result', () => {
+      const { eliminationDetails } = scoreGolden({ profile: lostEndDate });
+
+      expect(eliminationDetails.indeterminate[0].detail).toBe(
+        'years of experience could not be determined from the CV: "Backend Engineer" at "Halcyon Payments" (started 2018-06) has no end date, and a later role starts after it, so its end is unknown (rule asks for 5 years)',
+      );
+    });
+
+    it('sets hasIndeterminate false when every rule was answered', () => {
+      const { eliminationDetails } = scoreGolden();
+
+      expect(eliminationDetails.hasIndeterminate).toBe(false);
+      expect(eliminationDetails.indeterminate).toEqual([]);
+    });
+  });
+
   it('eliminates on an unchecked requirement the recruiter marked as hard', () => {
     // The location rule in the fixture carries on_missing: 'eliminate', which is
     // the opt-in decision 7-C describes for a legal requirement.

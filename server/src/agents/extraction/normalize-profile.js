@@ -1,15 +1,42 @@
 /**
- * Field-level repair of an extracted profile, after the schema and before
- * anything reads it.
+ * The seam between the profile the model returns and the profile the system
+ * stores. Two jobs, in this order:
  *
- * This module exists because of a decision taken in `profile.schema.js`: `email`
- * is a plain string rather than `z.string().email()`. Validation at the schema
- * boundary is all-or-nothing - one mangled OCR address would null the entire
- * extraction and burn a retry over a field nobody scores on. So the schema
- * accepts the string and this file decides what to do with it, which is to null
- * that one field and keep the other forty.
+ * 1. **Fill.** Every field the model left out becomes `null`, and the three flat
+ *    `location*` fields become the nested `location` object. After this step the
+ *    profile satisfies `profileSchema`.
+ * 2. **Repair.** Field-level checks the schema cannot express.
  *
- * Every rule here follows the same shape and it is worth stating once:
+ * ## Why there is a fill step at all
+ *
+ * `extractedProfileSchema` marks absence with an omitted key rather than an
+ * explicit `null`, because a nullable field compiles to a union in the JSON
+ * Schema and the API caps unions at sixteen - see the header of
+ * `profile.schema.js` for that limit and for the second one, on optional
+ * parameters, that decided which fields exist at all. Those are decisions about
+ * the wire and nothing else: `elimination.js`, `verify-evidence.js`,
+ * `compute-experience.js`, the evaluation prompt's profile rendering,
+ * `screen-candidate.js`, the `parsed_profile` column and the dashboard all read
+ * one shape, and this file is where it is produced.
+ *
+ * Filling is not repair and invents nothing. An absent key and an explicit
+ * `null` are the same claim - "the CV does not say" - written two ways, and this
+ * is where the second becomes the first.
+ *
+ * Keys are emitted in the order `profileShape` declares them rather than in
+ * whatever order the model generated, so the JSON rendered into the evaluation
+ * prompt is stable between two extractions of the same CV.
+ *
+ * ## Why there is a repair step at all
+ *
+ * A decision taken in `profile.schema.js`: `email` is a plain string rather than
+ * `z.string().email()`. Validation at the schema boundary is all-or-nothing -
+ * one mangled OCR address would null the entire extraction and burn a retry over
+ * a field nobody scores on. So the schema accepts the string and this file
+ * decides what to do with it, which is to null that one field and keep the other
+ * forty.
+ *
+ * Every repair rule follows the same shape and it is worth stating once:
  *
  * > **A field that fails a check becomes `null`, and the failure is recorded.
  * > Nothing is repaired into a value it did not have.**
@@ -20,11 +47,12 @@
  * `jane.doe@acme.com` is an invented fact about a real person, and it looks
  * exactly like a real one.
  *
- * Pure, and total: no clock, no I/O, no throw. The output still satisfies
+ * Pure, and total: no clock, no I/O, no throw. The output satisfies
  * `profileSchema`, which a test asserts, because the pipeline hands it straight
  * on to evidence verification.
  */
 
+import { EXTRACTED_LOCATION_FIELDS } from '../schemas/profile.schema.js';
 import { normalizeForMatch, normalizeWhitespace } from '../util/text.js';
 
 /**
@@ -54,6 +82,7 @@ const MAX_PLAUSIBLE_STATED_YEARS = 80;
 
 /**
  * @typedef {import('../schemas/profile.schema.js').Profile} Profile
+ * @typedef {import('../schemas/profile.schema.js').ExtractedProfile} ExtractedProfile
  *
  * @typedef {object} NormalizationChange
  * @property {string} field dotted path, e.g. `email` or `skills[2].evidenceQuote`
@@ -79,12 +108,122 @@ function tidy(value) {
 }
 
 /**
- * Normalizes a profile.
+ * An absent field and an explicit null are one claim written two ways.
  *
- * @param {Profile} profile straight from the schema
+ * @template T
+ * @param {T | undefined} value
+ * @returns {T | null}
+ */
+function present(value) {
+  return value === undefined ? null : value;
+}
+
+/**
+ * Rebuilds the nested `location` from the three flat fields the model fills in.
+ *
+ * `null` when the model left all three out, which is the same answer the nested
+ * shape used to give as an explicit `location: null`: the CV states no location
+ * at all. One field present is enough to make the object real, because a city
+ * with no country is an ordinary CV and decision 7-C wants the allowlist rule to
+ * read that as indeterminate rather than as a rejection.
+ *
+ * @param {ExtractedProfile} extracted
+ * @returns {Profile['location']}
+ */
+function nestLocation(extracted) {
+  const flat = Object.keys(EXTRACTED_LOCATION_FIELDS);
+  if (flat.every((field) => extracted[field] === undefined)) {
+    return null;
+  }
+
+  return /** @type {Profile['location']} */ (
+    Object.fromEntries(
+      flat.map((field) => [EXTRACTED_LOCATION_FIELDS[field], present(extracted[field])]),
+    )
+  );
+}
+
+/**
+ * Fills every absent field with `null` and re-nests the location, producing the
+ * shape `profileSchema` describes.
+ *
+ * Written out field by field rather than spread from the input on purpose: the
+ * spread would carry the flat `location*` keys through into a `.strict()` shape
+ * that has no place for them, and it would leave the key order at the mercy of
+ * whatever order the model generated.
+ *
+ * @param {ExtractedProfile} extracted
+ * @returns {Profile}
+ */
+function fillAbsentFields(extracted) {
+  return {
+    fullName: present(extracted.fullName),
+    email: present(extracted.email),
+    phone: present(extracted.phone),
+    linkedinUrl: present(extracted.linkedinUrl),
+    location: nestLocation(extracted),
+    statedYearsExperience: present(extracted.statedYearsExperience),
+    workHistory: fillEntries(extracted.workHistory, (entry) => ({
+      employer: present(entry.employer),
+      title: present(entry.title),
+      startDate: present(entry.startDate),
+      endDate: present(entry.endDate),
+      summary: present(entry.summary),
+    })),
+    education: fillEntries(extracted.education, (entry) => ({
+      institution: present(entry.institution),
+      degree: present(entry.degree),
+      field: present(entry.field),
+      level: present(entry.level),
+      endDate: present(entry.endDate),
+    })),
+    certifications: fillEntries(extracted.certifications, (entry) => ({
+      name: entry.name,
+      issuer: present(entry.issuer),
+      issuedDate: present(entry.issuedDate),
+      expiryDate: present(entry.expiryDate),
+    })),
+    skills: fillEntries(extracted.skills, (entry) => ({
+      name: entry.name,
+      evidenceType: entry.evidenceType,
+      evidenceQuote: present(entry.evidenceQuote),
+    })),
+  };
+}
+
+/**
+ * A list the model left out becomes `null`, not `[]`.
+ *
+ * The wire schema now **requires** all four lists, so the model can no longer
+ * leave one out: `[]` is how it says it looked and found nothing, and that was
+ * the point of making them required - an empty array invents nothing and costs
+ * neither of the API's two schema budgets.
+ *
+ * This branch survives anyway, and deliberately. It is what keeps the fill
+ * total: `profileSchema` still allows a null list, because `null` ("there is no
+ * such section in this profile at all") and `[]` ("extraction looked and found
+ * nothing") are different claims and `parsed_profile` is read by three other
+ * lanes. Collapsing an absent key to `[]` here would manufacture a claim the
+ * model never made.
+ *
+ * @template T, U
+ * @param {T[] | undefined} entries
+ * @param {(entry: T) => U} fill
+ * @returns {U[] | null}
+ */
+function fillEntries(entries, fill) {
+  return entries === undefined ? null : entries.map(fill);
+}
+
+/**
+ * Fills and normalizes a profile.
+ *
+ * @param {ExtractedProfile} extracted straight from `extractedProfileSchema`
  * @returns {NormalizationResult}
  */
-export function normalizeProfile(profile) {
+export function normalizeProfile(extracted) {
+  const profile = fillAbsentFields(extracted);
+
   /** @type {NormalizationChange[]} */
   const changes = [];
 
@@ -112,8 +251,6 @@ export function normalizeProfile(profile) {
       email,
       phone,
       linkedinUrl,
-      headline: text('headline', profile.headline),
-      summary: text('summary', profile.summary),
       location: normalizeLocation(profile.location, changes),
       statedYearsExperience: normalizeStatedYears(profile.statedYearsExperience, changes),
       workHistory: mapEntries(profile.workHistory, (entry, index) => ({
@@ -129,7 +266,6 @@ export function normalizeProfile(profile) {
         institution: text(`education[${index}].institution`, entry.institution),
         degree: text(`education[${index}].degree`, entry.degree),
         field: text(`education[${index}].field`, entry.field),
-        startDate: text(`education[${index}].startDate`, entry.startDate),
         endDate: text(`education[${index}].endDate`, entry.endDate),
       })),
       certifications: normalizeNamedEntries(
@@ -245,7 +381,6 @@ function normalizeLocation(location, changes) {
   }
 
   return {
-    raw: tidy(location.raw),
     city: tidy(location.city),
     region: tidy(location.region),
     countryCode,

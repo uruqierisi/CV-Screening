@@ -38,7 +38,7 @@ import {
 } from '../constants.js';
 import { InvalidRoleError, UnknownRuleTypeError } from '../errors.js';
 import { ELIMINATION_RULE_VALUE_SCHEMAS } from '../schemas/role.schema.js';
-import { parseCvDate } from '../extraction/compute-experience.js';
+import { explainMissingExperience, parseCvDate } from '../extraction/compute-experience.js';
 import { containsTokenSequence, equalsExact } from '../util/text.js';
 
 /**
@@ -128,13 +128,20 @@ export const ELIMINATION_RULE_EVALUATORS = Object.freeze(
      * Reads `computedYearsExperience` - derived from dates by
      * `compute-experience.js` - and never `statedYearsExperience`. The claim on
      * the CV is not the fact.
+     *
+     * A null computed value is an **unknown fact**, not a zero, and takes the
+     * 7-C path like every other unknown: `indeterminate`, and `on_missing`
+     * decides. The detail says so in words and then says *why*, naming the entry
+     * responsible - because "we could not tell" with no cause attached is a
+     * badge a recruiter cannot act on. `explainMissingExperience` is pure and
+     * takes the same injected `now`.
      */
-    min_years_experience(profile, value) {
+    min_years_experience(profile, value, { now }) {
       const years = profile.computedYearsExperience;
       if (typeof years !== 'number') {
         return {
           outcome: 'indeterminate',
-          detail: `no usable employment dates, so experience could not be computed (rule asks for ${value.years} years)`,
+          detail: `years of experience could not be determined from the CV: ${explainMissingExperience(profile.workHistory, { now })} (rule asks for ${value.years} years)`,
         };
       }
 

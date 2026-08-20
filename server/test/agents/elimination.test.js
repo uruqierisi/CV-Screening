@@ -26,8 +26,6 @@ function profileWith(overrides) {
     phone: null,
     linkedinUrl: null,
     location: null,
-    headline: null,
-    summary: null,
     statedYearsExperience: null,
     workHistory: null,
     education: null,
@@ -80,7 +78,9 @@ describe('min_years_experience', () => {
   it('is indeterminate when no dates could be resolved', () => {
     const result = evaluateOne(profileWith({ computedYearsExperience: null }), fiveYears);
     expect(result.outcome).toBe('indeterminate');
+    expect(result.detail).toContain('years of experience could not be determined from the CV');
     expect(result.detail).toContain('no usable employment dates');
+    expect(result.detail).toContain('rule asks for 5 years');
   });
 
   it('reads the computed value, never what the CV claims', () => {
@@ -88,6 +88,70 @@ describe('min_years_experience', () => {
     // the claim.
     const profile = profileWith({ statedYearsExperience: 15, computedYearsExperience: null });
     expect(evaluateOne(profile, fiveYears).outcome).toBe('indeterminate');
+  });
+
+  describe('when an entry has no end date and is not the latest role', () => {
+    /**
+     * A CV whose 2016 role lost its end date, with a later role after it. The
+     * computed value is null, and the recruiter has to be told which entry did
+     * it - "we could not tell" with no cause attached is a badge nobody can act
+     * on.
+     */
+    const workHistory = [
+      {
+        employer: 'Mercy General',
+        title: 'Staff Nurse',
+        startDate: '2016-01',
+        endDate: null,
+        summary: null,
+      },
+      {
+        employer: 'Riverside Clinic',
+        title: 'Bank Nurse',
+        startDate: '2017-06',
+        endDate: '2019-06',
+        summary: null,
+      },
+    ];
+    const gapProfile = profileWith({ workHistory, computedYearsExperience: null });
+
+    it('says the years could not be determined, and names the entry', () => {
+      const result = evaluateOne(gapProfile, fiveYears);
+
+      expect(result.outcome).toBe('indeterminate');
+      expect(result.detail).toBe(
+        'years of experience could not be determined from the CV: "Staff Nurse" at "Mercy General" (started 2016-01) has no end date, and a later role starts after it, so its end is unknown (rule asks for 5 years)',
+      );
+    });
+
+    it('never states a number it could not compute', () => {
+      // The defect wrote "10.7 years computed from dates, minimum 5" here, which
+      // reads as a measurement and was a guess.
+      expect(evaluateOne(gapProfile, fiveYears).detail).not.toMatch(/\d+(\.\d+)? years computed/);
+    });
+
+    it('flags rather than eliminates by default', () => {
+      const report = evaluateEliminationRules(gapProfile, [fiveYears], { now: NOW });
+
+      expect(report.eliminated).toBe(false);
+      expect(report.eliminatedBy).toBeNull();
+      expect(report.failures).toHaveLength(0);
+      expect(report.indeterminate).toHaveLength(1);
+      expect(report.results[0].eliminates).toBe(false);
+    });
+
+    it('eliminates when the recruiter marked this requirement hard', () => {
+      const hard = rule('min_years_experience', { years: 5 }, 'eliminate');
+      const report = evaluateEliminationRules(gapProfile, [hard], { now: NOW });
+
+      expect(report.eliminated).toBe(true);
+      expect(report.eliminatedBy).toBe('rule for min_years_experience');
+      // Still an unchecked requirement, not a proven failure - the badge has to
+      // keep saying so even though the candidate was removed.
+      expect(report.failures).toHaveLength(0);
+      expect(report.indeterminate).toHaveLength(1);
+      expect(report.indeterminate[0].detail).toContain('"Staff Nurse" at "Mercy General"');
+    });
   });
 });
 

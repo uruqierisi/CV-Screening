@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  EXTRACTED_LOCATION_FIELDS,
   certificationSchema,
   educationSchema,
+  extractedProfileSchema,
   profileSchema,
   skillSchema,
   verifiedProfileSchema,
@@ -17,9 +19,25 @@ import { InvalidRoleError } from '../../src/agents/errors.js';
 
 /**
  * Schemas are tested for the properties the plan argues for, not for "does zod
- * work". The three that matter: nullable everywhere so the model has a legal way
- * to say nothing, no escape hatch for a fabricated field, and nowhere at all to
- * put a score.
+ * work". The three that matter: the model always has a legal way to say nothing,
+ * there is no escape hatch for a fabricated field, and there is nowhere at all
+ * to put a score.
+ *
+ * The first of those is now spelled two different ways, and the difference is
+ * the point of the split below. `extractedProfileSchema` - the one sent to the
+ * API - says nothing by **omitting** the field, because a nullable field
+ * compiles to a union and the API rejects a schema carrying more than sixteen of
+ * them. `profileSchema` - the one stored and read - says it with an explicit
+ * `null`, because a database column, a dashboard cell and an elimination rule
+ * all want a key that is always there. `normalize-profile.js` turns the first
+ * into the second, and `normalize-profile.test.js` holds it to that.
+ *
+ * The wire shape then lost four fields outright to the API's *other* cap - 24
+ * optional parameters - and they left the stored shape with them: `headline`,
+ * profile-level `summary`, `locationRaw` and `education[].startDate` are read by
+ * nothing, and `workHistory[].isCurrent` was a second encoding of a fact
+ * `endDate` already carried. `schema-drift.test.js` is what stops the two
+ * schemas losing or gaining a field independently from here on.
  */
 
 /**
@@ -32,8 +50,6 @@ function validProfile(overrides = {}) {
     phone: null,
     linkedinUrl: null,
     location: null,
-    headline: null,
-    summary: null,
     statedYearsExperience: null,
     workHistory: null,
     education: null,
@@ -51,6 +67,8 @@ describe('profileSchema', () => {
   });
 
   it('makes every top-level field nullable and none of them optional', () => {
+    // The storage contract: a consumer reading `profile.location` never has to
+    // ask whether the key exists, only whether it is null.
     for (const [name, field] of Object.entries(profileSchema.shape)) {
       expect(field.isNullable(), `${name} should be nullable`).toBe(true);
       expect(field.isOptional(), `${name} should not be optional`).toBe(false);
@@ -80,7 +98,6 @@ describe('profileSchema', () => {
             title: null,
             startDate: 'Spring 2019',
             endDate: 'Present',
-            isCurrent: true,
             summary: null,
           },
         ],
@@ -136,7 +153,6 @@ describe('profileSchema', () => {
           title: null,
           startDate: null,
           endDate: null,
-          isCurrent: null,
           summary: null,
         }).success,
       ).toBe(true);
@@ -148,7 +164,6 @@ describe('profileSchema', () => {
         degree: 'Diplom-Ingenieur',
         field: null,
         level: null,
-        startDate: null,
         endDate: null,
       };
       expect(educationSchema.safeParse(entry).success).toBe(true);
@@ -183,6 +198,188 @@ describe('profileSchema', () => {
     // accident.
     expect(profileSchema.safeParse(validProfile({ skills: null })).success).toBe(true);
     expect(profileSchema.safeParse(validProfile({ skills: [] })).success).toBe(true);
+  });
+});
+
+describe('extractedProfileSchema, which is the one the API compiles', () => {
+  /**
+   * The API turns this schema into a decoding grammar and caps it twice: at
+   * sixteen union-typed parameters and at twenty-four optional ones.
+   *
+   * > "Schemas contains too many parameters with union types (32 parameters with
+   * > type arrays or anyOf) ... (limit: 16 parameters with unions)."
+   *
+   * > "Schemas contains too many optional parameters (31), which would make
+   * > grammar compilation inefficient ... (limit: 24)."
+   *
+   * `.nullable()` costs a union, `.optional()` costs an optional, and only
+   * *required* costs neither. The counts themselves are asserted in
+   * `schema-budget.test.js`; what is asserted here are the schema properties
+   * that keep them where they are.
+   */
+
+  /**
+   * A model response with the four required lists present, which every valid
+   * response now has.
+   *
+   * @param {Record<string, unknown>} [overrides]
+   */
+  function extracted(overrides = {}) {
+    return {
+      workHistory: [],
+      education: [],
+      certifications: [],
+      skills: [],
+      ...overrides,
+    };
+  }
+
+  const REQUIRED_LISTS = ['workHistory', 'education', 'certifications', 'skills'];
+
+  it('makes every uncertain scalar optional and requires the four lists', () => {
+    for (const [name, field] of Object.entries(extractedProfileSchema.shape)) {
+      const shouldBeRequired = REQUIRED_LISTS.includes(name);
+      expect(field.isOptional(), `${name} optional?`).toBe(!shouldBeRequired);
+    }
+  });
+
+  it('accepts a response in which the model knew nothing at all', () => {
+    // The honest answer for an unreadable CV, and it has to be a legal one -
+    // otherwise the model is pushed into inventing. Four empty lists and no
+    // other key is now what the all-null profile used to be.
+    expect(extractedProfileSchema.safeParse(extracted()).success).toBe(true);
+  });
+
+  it('requires the four lists, because an empty one is a safe way to say "none"', () => {
+    // This is what took the optional count from 31 to 27 without giving the
+    // model anything to invent: `[]` says "I looked and found nothing", which is
+    // a true sentence about a CV with no certifications.
+    for (const list of REQUIRED_LISTS) {
+      const { [list]: _dropped, ...withoutOne } = extracted();
+      expect(extractedProfileSchema.safeParse(withoutOne).success, list).toBe(false);
+    }
+  });
+
+  it('reads an explicit null on an optional field as the field being absent', () => {
+    // Not silent repair of an error. On this contract `null` and absent are the
+    // same claim - "the CV does not say" - and `normalize-profile.js` fills
+    // absent with `null` a line later anyway. Failing validation, burning a
+    // retry and real money over an equivalent encoding would be brittle for no
+    // benefit. It costs nothing on either budget: the generated JSON Schema is
+    // identical, which `schema-budget.test.js` measures.
+    const parsed = extractedProfileSchema.safeParse(extracted({ email: null }));
+
+    expect(parsed.success).toBe(true);
+    // `undefined`, not `null` and not a key that was never there: zod keeps the
+    // key it was handed and empties it. Every reader downstream - `JSON`, the
+    // `present()` fill in `normalize-profile.js`, `toEqual` - treats that as
+    // absent, which is the whole claim being made here.
+    expect(parsed.data.email).toBeUndefined();
+  });
+
+  it('reads an explicit null inside a list entry the same way', () => {
+    const parsed = extractedProfileSchema.safeParse(
+      extracted({
+        workHistory: [{ employer: 'Northwind', title: null, endDate: null }],
+        skills: [{ name: 'Go', evidenceType: 'listed_only', evidenceQuote: null }],
+      }),
+    );
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.data.workHistory[0]).toEqual({ employer: 'Northwind' });
+    expect(parsed.data.skills[0]).toEqual({ name: 'Go', evidenceType: 'listed_only' });
+  });
+
+  it('still rejects a null where the schema requires a list or a value', () => {
+    // The tolerance above is exactly as wide as the equivalence that justifies
+    // it. A required list has no "absent" for `null` to mean the same thing as -
+    // the contract says always send an array, and `[]` is how you say you found
+    // none - so this is a real mismatch and takes the ordinary semantic retry.
+    expect(extractedProfileSchema.safeParse(extracted({ skills: null })).success).toBe(false);
+    expect(
+      extractedProfileSchema.safeParse(
+        extracted({ skills: [{ name: 'Go', evidenceType: null }] }),
+      ).success,
+    ).toBe(false);
+    expect(
+      extractedProfileSchema.safeParse(extracted({ skills: [{ name: null, evidenceType: 'listed_only' }] }))
+        .success,
+    ).toBe(false);
+  });
+
+  it('takes the location as three flat fields, not as a nested object', () => {
+    // Nested, `location` cost five of the sixteen union-typed parameters on its
+    // own: one for the optional object and one per field. `locationRaw` then
+    // went to the optional budget - the allowlist rule reads `countryCode` and
+    // nothing else, and no other consumer read the raw string at all.
+    expect(Object.keys(extractedProfileSchema.shape)).toEqual(
+      expect.arrayContaining(Object.keys(EXTRACTED_LOCATION_FIELDS)),
+    );
+    expect(Object.keys(EXTRACTED_LOCATION_FIELDS)).toEqual([
+      'locationCity',
+      'locationRegion',
+      'locationCountryCode',
+    ]);
+    expect(extractedProfileSchema.shape.location).toBeUndefined();
+
+    expect(
+      extractedProfileSchema.safeParse(
+        extracted({ locationCity: 'Manchester', locationCountryCode: 'GB' }),
+      ).success,
+    ).toBe(true);
+    expect(
+      extractedProfileSchema.safeParse(extracted({ location: { city: 'Manchester' } })).success,
+    ).toBe(false);
+  });
+
+  it('has no key for the facts that were deleted rather than kept', () => {
+    // Deleted from both schemas, not left on the wire and dropped, and not kept
+    // as a permanently-null field in storage: nothing scores any of them, and a
+    // field that is null by construction is dead weight in `parsed_profile` and
+    // a trap for the next reader.
+    for (const gone of ['headline', 'summary', 'locationRaw']) {
+      expect(Object.keys(extractedProfileSchema.shape)).not.toContain(gone);
+    }
+    expect(
+      extractedProfileSchema.safeParse(extracted({ headline: 'Staff Engineer' })).success,
+    ).toBe(false);
+  });
+
+  it('has one way to say a role is current, not two', () => {
+    // `isCurrent` was a second encoding of a fact `endDate` already carried, and
+    // two encodings of one fact is a drift surface. Absence of `endDate` is the
+    // survivor; `compute-experience.js` reads it that way and the prompt says so.
+    const entry = extractedProfileSchema.shape.workHistory.element.shape;
+    expect(Object.keys(entry)).toEqual(['employer', 'title', 'startDate', 'endDate', 'summary']);
+  });
+
+  it('still rejects an unknown key rather than stripping it', () => {
+    // The property that stops a model inventing a field - most importantly a
+    // score - survives both the move to optional and the null tolerance, which
+    // is the one thing that could have been lost by making absence cheap.
+    const parsed = extractedProfileSchema.safeParse(extracted({ matchScore: 91 }));
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.error.issues[0].message).toContain('Unrecognized key');
+  });
+
+  it('still refuses a nameless skill and a third evidenceType', () => {
+    const base = { name: 'Go', evidenceType: 'demonstrated' };
+    expect(extractedProfileSchema.safeParse(extracted({ skills: [base] })).success).toBe(true);
+    expect(
+      extractedProfileSchema.safeParse(extracted({ skills: [{ evidenceType: 'listed_only' }] }))
+        .success,
+    ).toBe(false);
+    expect(
+      extractedProfileSchema.safeParse(extracted({ skills: [{ name: 'Go', evidenceType: 'probably' }] }))
+        .success,
+    ).toBe(false);
+  });
+
+  it('has nowhere to put a score, a tier or a rating', () => {
+    for (const key of ['score', 'matchScore', 'fitCategory', 'tier', 'rating', 'overall']) {
+      expect(Object.keys(extractedProfileSchema.shape)).not.toContain(key);
+    }
   });
 });
 

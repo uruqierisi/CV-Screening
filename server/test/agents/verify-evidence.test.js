@@ -25,8 +25,6 @@ function profileWithSkills(skills) {
     phone: null,
     linkedinUrl: null,
     location: null,
-    headline: null,
-    summary: null,
     statedYearsExperience: null,
     workHistory: null,
     education: null,

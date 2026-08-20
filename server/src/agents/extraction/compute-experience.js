@@ -8,7 +8,7 @@
  * information a recruiter wants and a number no model should be trusted to
  * produce.
  *
- * Two properties are non-negotiable:
+ * Three properties are non-negotiable:
  *
  * - **Overlapping employment is merged, never summed.** Two concurrent jobs in
  *   2021 are one year of experience, not two. Anything else rewards a CV for
@@ -16,6 +16,8 @@
  * - **`now` is injected.** Reaching for `Date.now()` here would make every test
  *   of this file expire, and would make a candidate's score depend on when the
  *   worker happened to run.
+ * - **A number comes back only when the dates support one.** Where they do not,
+ *   the answer is `null` - never a plausible figure derived from a guess.
  *
  * And one deliberate asymmetry: an unresolvable history yields **null**, not 0.
  * Null means "we could not tell" and makes a minimum-experience rule
@@ -29,6 +31,64 @@
  * Month names are parsed in English only. Plan section 8 already records
  * non-English CVs as a known limitation; this is one of the places it bites, and
  * the failure mode is an unusable entry - reported, never guessed at.
+ *
+ * ## An absent end date is *current* only when nothing starts after it
+ *
+ * This is the one judgement in this file worth arguing with, and it has been
+ * wrong twice in opposite directions. Both are kept, because the rule below is
+ * only defensible against both of them.
+ *
+ * **First encoding.** The work-history entry carried a tri-state `isCurrent`
+ * beside `endDate`, so an entry with neither was "the CV did not say when this
+ * ended" and became an **unusable** entry contributing nothing. That threw away
+ * the ordinary "March 2021 -" current role and could null out a candidate's
+ * entire experience. It also cost an optional parameter out of a schema budget
+ * of 24 - see `profile.schema.js` - so `isCurrent` was deleted.
+ *
+ * **Second encoding, and the defect it caused.** With `isCurrent` gone, *every*
+ * absent `endDate` was read as "still there" and closed at `now`. That is right
+ * for a current role and badly wrong for a finished one whose end date the
+ * extraction lost. Measured at `now = 2026-08`, a single twelve-month job
+ * written `2016-01 - 2017-01` computes **1.1 years** and fails a five-year
+ * minimum; the *same job* with its end date missing computed **10.7 years** and
+ * passed it. One summer internship dated `2015-06` with no end computed **11.3
+ * years**. The elimination detail then read *"10.7 years computed from dates,
+ * minimum 5"* - a manufactured number wearing the clothes of a measurement.
+ *
+ * **The rule now.** An entry with `endDate === null` is **current, and closes at
+ * `now`, if and only if no other entry in the work history starts strictly
+ * later.** A CV lists roles as a sequence; if the candidate started another role
+ * after this one, this one ended, whatever the CV forgot to say. Entries tied at
+ * the latest start date are concurrent current roles, not an ambiguity, and all
+ * of them close at `now`.
+ *
+ * Otherwise the absent end is an **extraction gap**, and
+ * `computedYearsExperience` becomes `null` - the whole value, not just that
+ * entry. Dropping the entry and totalling the rest would undercount, which is
+ * the same crime in the other direction and produces the same thing this module
+ * exists to refuse: a confident number nobody can account for. The recruiter is
+ * told the years could not be determined and which entry caused it, and
+ * `on_missing` then decides, exactly as it does for every other unknown fact.
+ *
+ * **The one exception, because it costs nothing to be right here.** If the
+ * intervals that *are* resolvable already cover the span from the unresolvable
+ * entry's start through `now`, then whatever its true end date, the merged union
+ * is unchanged - the entry cannot move the total by a single month. The answer
+ * stays determinate and is returned. Without this, a CV listing contiguous or
+ * overlapping roles would go indeterminate over a gap that provably cannot
+ * change the answer, which is a false alarm, and false alarms train a recruiter
+ * to ignore the badge.
+ *
+ * Everything else about `endDate` is unchanged: an explicit "Present" or
+ * "Current" is still a current role however the entry is ordered, a future end
+ * date is still clamped back to `now`, and an unparseable end date is still its
+ * own `unusable` reason.
+ *
+ * **The cost of the rule, stated rather than buried.** A CV that lists a genuine
+ * current role *before* a short later contract - or that lists a role starting in
+ * the future - now yields `null` where the old code yielded a number. That is
+ * the trade decision 7-C asks for: an admitted gap a recruiter can see beats a
+ * confident wrong number they cannot.
  */
 
 import { MONTHS_PER_YEAR } from '../constants.js';
@@ -45,14 +105,29 @@ import { normalizeForMatch } from '../util/text.js';
  *
  * @typedef {object} UnusableEntry
  * @property {number} index position in the work history as extracted
- * @property {'missing_start' | 'unparseable_start' | 'missing_end' | 'unparseable_end'
+ * @property {'missing_start' | 'unparseable_start' | 'unparseable_end'
  *   | 'ends_before_start' | 'starts_in_the_future'} reason
  *
+ * @typedef {object} UndeterminedEntry an open-ended entry that is not current
+ * @property {number} index position in the work history as extracted
+ * @property {'open_end_superseded'} reason a later role starts after this one, so
+ *   the absent end date is an extraction gap rather than "still there"
+ * @property {string | null} employer as extracted, so the entry can be named
+ * @property {string | null} title as extracted
+ * @property {string} startDate as the CV wrote it
+ * @property {boolean} coveredByOtherRoles when true, the resolvable intervals
+ *   already span this entry's start through `now`, so no possible end date
+ *   changes the total and the result stays determinate
+ *
  * @typedef {object} ComputedExperience
- * @property {number | null} computedYearsExperience one decimal, or null if nothing resolved
- * @property {number | null} totalMonths merged months, or null if nothing resolved
- * @property {ExperienceSegment[]} segments the merged intervals, chronologically
+ * @property {number | null} computedYearsExperience one decimal, or null when the
+ *   dates do not determine an answer
+ * @property {number | null} totalMonths merged months, or null on the same terms
+ * @property {ExperienceSegment[]} segments the merged intervals, chronologically;
+ *   empty whenever the result is null, because half a timeline reads as fact
  * @property {UnusableEntry[]} unusable entries that could not be turned into an interval
+ * @property {UndeterminedEntry[]} undetermined open-ended entries that are not
+ *   current; any one of them with `coveredByOtherRoles: false` nulls the result
  */
 
 /**
@@ -173,18 +248,32 @@ function isPresentWord(value) {
 }
 
 /**
- * Turns one work-history entry into a closed month interval, or explains why it
- * could not.
+ * A field a recruiter will read, or null. An empty or whitespace-only employer is
+ * not a name, and printing one in an elimination reason produces `""`.
  *
- * A year-only start is taken as January and a year-only end as December: the
- * entry says "2019 to 2021", and reading that as one month in each year would
- * understate three years of work as two.
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+function textOrNull(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
+/**
+ * The start of one entry as a month index, or why there is not one.
+ *
+ * A year-only start is taken as January: the entry says "2019 to 2021", and
+ * reading that as one month in each year would understate three years of work as
+ * two.
  *
  * @param {WorkExperience} entry
- * @param {number} nowIndex
- * @returns {{ start: number, end: number } | { reason: UnusableEntry['reason'] }}
+ * @returns {{ startIndex: number } | { reason: 'missing_start' | 'unparseable_start' }}
  */
-function resolveInterval(entry, nowIndex) {
+function resolveStart(entry) {
   if (entry.startDate === null) {
     return { reason: 'missing_start' };
   }
@@ -194,14 +283,65 @@ function resolveInterval(entry, nowIndex) {
     return { reason: 'unparseable_start' };
   }
 
-  const startIndex = toMonthIndex(start.year, start.month ?? 1);
+  return { startIndex: toMonthIndex(start.year, start.month ?? 1) };
+}
+
+/**
+ * The latest start date anywhere in the history, which is the whole basis of the
+ * current-role rule: an entry with no end date is current exactly when nothing
+ * starts after it.
+ *
+ * Entries whose start cannot be read are ignored - they cannot establish an
+ * ordering. Entries whose *end* is unusable are **not** ignored: a later role
+ * with a garbled end date is still a later role, and still says the earlier one
+ * finished.
+ *
+ * @param {WorkExperience[]} entries
+ * @returns {number | null} null when no entry has a readable start date
+ */
+function findLatestStartIndex(entries) {
+  /** @type {number | null} */
+  let latest = null;
+
+  for (const entry of entries) {
+    const start = resolveStart(entry);
+    if ('startIndex' in start && (latest === null || start.startIndex > latest)) {
+      latest = start.startIndex;
+    }
+  }
+
+  return latest;
+}
+
+/**
+ * Turns one work-history entry into a closed month interval, or explains why it
+ * could not.
+ *
+ * A year-only end is taken as December, the mirror image of the reason a
+ * year-only start is taken as January.
+ *
+ * @param {WorkExperience} entry
+ * @param {object} ctx
+ * @param {number} ctx.nowIndex
+ * @param {number | null} ctx.latestStartIndex
+ * @returns {{ start: number, end: number }
+ *   | { undetermined: true, startIndex: number }
+ *   | { reason: UnusableEntry['reason'] }}
+ */
+function resolveInterval(entry, { nowIndex, latestStartIndex }) {
+  const start = resolveStart(entry);
+  if ('reason' in start) {
+    return start;
+  }
+
+  const { startIndex } = start;
   if (startIndex > nowIndex) {
     return { reason: 'starts_in_the_future' };
   }
 
-  const endIndex = resolveEndIndex(entry, nowIndex);
+  const endIndex = resolveEndIndex(entry, { nowIndex, startIndex, latestStartIndex });
   if (typeof endIndex !== 'number') {
-    return endIndex;
+    return 'reason' in endIndex ? endIndex : { undetermined: true, startIndex };
   }
 
   if (endIndex < startIndex) {
@@ -213,18 +353,25 @@ function resolveInterval(entry, nowIndex) {
 
 /**
  * @param {WorkExperience} entry
- * @param {number} nowIndex
- * @returns {number | { reason: UnusableEntry['reason'] }}
+ * @param {object} ctx
+ * @param {number} ctx.nowIndex
+ * @param {number} ctx.startIndex this entry's start, already resolved
+ * @param {number | null} ctx.latestStartIndex never null when this is reached -
+ *   this entry has a readable start, so at least one exists
+ * @returns {number | { undetermined: true } | { reason: UnusableEntry['reason'] }}
  */
-function resolveEndIndex(entry, nowIndex) {
+function resolveEndIndex(entry, { nowIndex, startIndex, latestStartIndex }) {
   if (entry.endDate === null) {
-    // `isCurrent` is tri-state on purpose. True closes the interval at `now`;
-    // null means the CV did not say, and guessing "still there" would hand a
-    // candidate every month since their last dated job.
-    return entry.isCurrent === true ? nowIndex : { reason: 'missing_end' };
+    // The rule from the header. `>=` rather than `===` so that entries tied at
+    // the latest start are all current: two concurrent roles both written with no
+    // end date are two current roles, not an ambiguity.
+    return startIndex >= /** @type {number} */ (latestStartIndex)
+      ? nowIndex
+      : { undetermined: true };
   }
 
   if (isPresentWord(entry.endDate)) {
+    // An explicit word beats position in the list. The candidate said it.
     return nowIndex;
   }
 
@@ -267,6 +414,24 @@ function mergeIntervals(intervals) {
 }
 
 /**
+ * The coverage exception: is `[startIndex, nowIndex]` already inside one merged
+ * segment?
+ *
+ * The segments are disjoint and non-adjacent by the time this runs, so a span
+ * they cover must sit inside a single one of them. If it does, an entry starting
+ * at `startIndex` contributes nothing whatever its true end date - every possible
+ * end lies between its start and `now`, and that whole range is already counted.
+ *
+ * @param {{ start: number, end: number }[]} merged
+ * @param {number} startIndex
+ * @param {number} nowIndex
+ * @returns {boolean}
+ */
+function coversThroughNow(merged, startIndex, nowIndex) {
+  return merged.some((segment) => segment.start <= startIndex && segment.end >= nowIndex);
+}
+
+/**
  * @param {WorkExperience[] | null} workHistory
  * @param {object} params
  * @param {Date} params.now injected, never read from the clock
@@ -281,27 +446,55 @@ export function computeExperience(workHistory, { now } = /** @type {any} */ ({})
 
   const nowIndex = toMonthIndex(now.getUTCFullYear(), now.getUTCMonth() + 1);
   const entries = Array.isArray(workHistory) ? workHistory : [];
+  const latestStartIndex = findLatestStartIndex(entries);
 
   /** @type {{ start: number, end: number }[]} */
   const intervals = [];
   /** @type {UnusableEntry[]} */
   const unusable = [];
+  /** @type {{ index: number, entry: WorkExperience, startIndex: number }[]} */
+  const openEnded = [];
 
   entries.forEach((entry, index) => {
-    const resolved = resolveInterval(entry, nowIndex);
+    const resolved = resolveInterval(entry, { nowIndex, latestStartIndex });
     if ('reason' in resolved) {
       unusable.push({ index, reason: resolved.reason });
+      return;
+    }
+    if ('undetermined' in resolved) {
+      openEnded.push({ index, entry, startIndex: resolved.startIndex });
       return;
     }
     intervals.push(resolved);
   });
 
-  if (intervals.length === 0) {
-    // Null, not zero. See the header: absence is not evidence of failure.
-    return { computedYearsExperience: null, totalMonths: null, segments: [], unusable };
+  const merged = mergeIntervals(intervals);
+
+  /** @type {UndeterminedEntry[]} */
+  const undetermined = openEnded.map(({ index, entry, startIndex }) => ({
+    index,
+    reason: /** @type {'open_end_superseded'} */ ('open_end_superseded'),
+    employer: textOrNull(entry.employer),
+    title: textOrNull(entry.title),
+    startDate: /** @type {string} */ (entry.startDate),
+    coveredByOtherRoles: coversThroughNow(merged, startIndex, nowIndex),
+  }));
+
+  const blocking = undetermined.filter((entry) => !entry.coveredByOtherRoles);
+
+  if (intervals.length === 0 || blocking.length > 0) {
+    // Null, not zero - and null for the whole value rather than a total with the
+    // offending entry quietly dropped. See the header: absence is not evidence of
+    // failure, and an undercount is not an improvement on an overcount.
+    return {
+      computedYearsExperience: null,
+      totalMonths: null,
+      segments: [],
+      unusable,
+      undetermined,
+    };
   }
 
-  const merged = mergeIntervals(intervals);
   const segments = merged.map((interval) => ({
     start: toIsoMonth(interval.start),
     end: toIsoMonth(interval.end),
@@ -314,7 +507,58 @@ export function computeExperience(workHistory, { now } = /** @type {any} */ ({})
     totalMonths,
     segments,
     unusable,
+    undetermined,
   };
+}
+
+/**
+ * Names one open-ended entry the way a recruiter would recognise it on the page.
+ *
+ * @param {UndeterminedEntry} entry
+ * @returns {string}
+ */
+export function describeUndeterminedEntry(entry) {
+  const title = entry.title === null ? null : `"${entry.title}"`;
+  const employer = entry.employer === null ? null : `"${entry.employer}"`;
+  const named =
+    title !== null && employer !== null
+      ? `${title} at ${employer}`
+      : (title ?? employer ?? 'an unnamed role');
+
+  return `${named} (started ${entry.startDate})`;
+}
+
+/**
+ * Why the years could not be determined, in one clause a recruiter can act on.
+ *
+ * Called only when `computedYearsExperience` is null. It recomputes rather than
+ * reading a stored diagnostic, because the diagnostic is not on the profile:
+ * `parsed_profile` holds the facts the model extracted, not this module's
+ * working. The recomputation is pure, bounded by the length of the work history,
+ * and takes the same injected `now` as the rest of the evaluation - so it agrees
+ * with the stored value whenever the caller passes the clock that value was
+ * computed with. Where it does not agree, the generic clause is returned rather
+ * than a claim about a specific entry.
+ *
+ * @param {WorkExperience[] | null} workHistory
+ * @param {object} params
+ * @param {Date} params.now
+ * @returns {string}
+ */
+export function explainMissingExperience(workHistory, { now }) {
+  const { undetermined } = computeExperience(workHistory, { now });
+  const blocking = undetermined.filter((entry) => !entry.coveredByOtherRoles);
+
+  if (blocking.length === 0) {
+    return 'no usable employment dates';
+  }
+
+  return blocking
+    .map(
+      (entry) =>
+        `${describeUndeterminedEntry(entry)} has no end date, and a later role starts after it, so its end is unknown`,
+    )
+    .join('; ');
 }
 
 /**

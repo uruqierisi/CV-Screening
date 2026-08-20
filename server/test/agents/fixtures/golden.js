@@ -128,17 +128,16 @@ export const GOLDEN_PROFILE = deepFreeze({
   email: 'priya.ramanathan@example.com',
   phone: null,
   linkedinUrl: null,
-  location: { raw: 'Manchester, United Kingdom', city: 'Manchester', region: null, countryCode: 'GB' },
-  headline: 'Senior Software Engineer',
-  summary: null,
+  location: { city: 'Manchester', region: null, countryCode: 'GB' },
   statedYearsExperience: 9,
   workHistory: [
     {
       employer: 'Northwind Logistics',
       title: 'Senior Backend Engineer',
       startDate: '2021-03',
+      // No end date is how this format says "still there" - see
+      // `compute-experience.js`. `isCurrent` used to say it a second way.
       endDate: null,
-      isCurrent: true,
       summary: 'Rebuilt the shipment tracking service in Node.js.',
     },
     {
@@ -146,7 +145,6 @@ export const GOLDEN_PROFILE = deepFreeze({
       title: 'Backend Engineer',
       startDate: '2018-06',
       endDate: '2021-02',
-      isCurrent: false,
       summary: 'Built and owned the settlement API.',
     },
   ],
@@ -156,7 +154,6 @@ export const GOLDEN_PROFILE = deepFreeze({
       degree: 'BSc Computer Science',
       field: 'Computer Science',
       level: 'bachelors',
-      startDate: '2014',
       endDate: '2017',
     },
   ],
@@ -179,6 +176,77 @@ export const GOLDEN_PROFILE = deepFreeze({
   // months merged = 7.8 years.
   computedYearsExperience: 7.8,
 });
+
+/**
+ * The same candidate in the shape the **model** returns: flat location, and no
+ * key at all where the CV says nothing.
+ *
+ * Written out by hand rather than derived from `GOLDEN_PROFILE`, because the
+ * relationship between the two is exactly what
+ * `normalize-profile.test.js` asserts, and a fixture that computed one from the
+ * other could only ever agree with itself.
+ *
+ * Two absences are claims rather than gaps, and both are load-bearing:
+ * `certifications: []` is "I looked and there are none" - the four lists are
+ * required on the wire, so an empty one is the only way to say that - and the
+ * first role's missing `endDate` is "this role has not ended".
+ */
+export const GOLDEN_EXTRACTED = deepFreeze({
+  fullName: 'Priya Ramanathan',
+  email: 'priya.ramanathan@example.com',
+  locationCity: 'Manchester',
+  locationCountryCode: 'GB',
+  statedYearsExperience: 9,
+  workHistory: [
+    {
+      employer: 'Northwind Logistics',
+      title: 'Senior Backend Engineer',
+      startDate: '2021-03',
+      summary: 'Rebuilt the shipment tracking service in Node.js.',
+    },
+    {
+      employer: 'Halcyon Payments',
+      title: 'Backend Engineer',
+      startDate: '2018-06',
+      endDate: '2021-02',
+      summary: 'Built and owned the settlement API.',
+    },
+  ],
+  education: [
+    {
+      institution: 'University of Leeds',
+      degree: 'BSc Computer Science',
+      field: 'Computer Science',
+      level: 'bachelors',
+      endDate: '2017',
+    },
+  ],
+  certifications: [],
+  skills: [
+    {
+      name: 'Node.js',
+      evidenceType: 'demonstrated',
+      evidenceQuote: 'Rebuilt the shipment tracking service in Node.js',
+    },
+    {
+      name: 'PostgreSQL',
+      evidenceType: 'demonstrated',
+      evidenceQuote: 'Designed the PostgreSQL schema behind it',
+    },
+    { name: 'Kubernetes', evidenceType: 'listed_only' },
+  ],
+});
+
+/**
+ * `GOLDEN_EXTRACTED` with fields replaced, for a test that wants one thing
+ * different about what the model said.
+ *
+ * @param {Record<string, unknown>} [overrides]
+ * @returns {Record<string, unknown>} a fresh, unfrozen object
+ */
+export function extractedProfile(overrides = {}) {
+  return { ...GOLDEN_EXTRACTED, ...overrides };
+}
 
 export const GOLDEN_EVALUATION = deepFreeze({
   ratings: [

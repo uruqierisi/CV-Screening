@@ -1,34 +1,49 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeProfile } from '../../src/agents/extraction/normalize-profile.js';
-import { profileSchema } from '../../src/agents/schemas/profile.schema.js';
+import {
+  extractedProfileSchema,
+  profileSchema,
+} from '../../src/agents/schemas/profile.schema.js';
+import { GOLDEN_EXTRACTED, GOLDEN_PROFILE } from './fixtures/golden.js';
 
 /**
- * One rule, tested from every side: **a field that fails a check becomes `null`,
- * and nothing is repaired into a value it did not have.**
+ * Two rules, tested from every side.
  *
- * The second half is what these tests are really about. Nulling a mangled email
- * costs nothing - `null` already means "we could not tell" everywhere in this
- * system. Repairing `jane doe at acme.com` into `jane.doe@acme.com` would invent
- * a fact about a real person that looks exactly like a real one.
+ * **Fill: every field the model left out comes back as `null`, and the four flat
+ * `location*` fields come back as one nested object.** That is what keeps this
+ * refactor invisible to the four consumers downstream of it, and the first
+ * describe block below asserts the whole output shape rather than one field of
+ * it.
+ *
+ * **Repair: a field that fails a check becomes `null`, and nothing is repaired
+ * into a value it did not have.** Nulling a mangled email costs nothing - `null`
+ * already means "we could not tell" everywhere in this system. Repairing
+ * `jane doe at acme.com` into `jane.doe@acme.com` would invent a fact about a
+ * real person that looks exactly like a real one.
  */
 
-/** @param {Partial<import('../../src/agents/schemas/profile.schema.js').Profile>} overrides */
+/**
+ * A profile in the shape the **model** returns it: absent keys where the CV says
+ * nothing, flat location, and the four lists always present because the wire
+ * schema requires them.
+ *
+ * Every fixture is put through `extractedProfileSchema` first, so a test can
+ * never assert something about a response the API would not have let through.
+ *
+ * @param {Record<string, unknown>} [overrides]
+ */
 function profile(overrides = {}) {
-  return {
+  const candidate = {
     fullName: 'A. Candidate',
-    email: null,
-    phone: null,
-    linkedinUrl: null,
-    location: null,
-    headline: null,
-    summary: null,
-    statedYearsExperience: null,
-    workHistory: null,
-    education: null,
-    certifications: null,
-    skills: null,
+    workHistory: [],
+    education: [],
+    certifications: [],
+    skills: [],
     ...overrides,
   };
+  const parsed = extractedProfileSchema.safeParse(candidate);
+  expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true);
+  return parsed.data;
 }
 
 describe('normalizeProfile', () => {
@@ -46,11 +61,129 @@ describe('normalizeProfile', () => {
       profile({
         email: 'not an address',
         skills: [{ name: ' Python ', evidenceType: 'listed_only', evidenceQuote: 'stray' }],
-        certifications: [{ name: '  ', issuer: null, issuedDate: null, expiryDate: null }],
+        certifications: [{ name: '  ' }],
       }),
     );
 
     expect(profileSchema.safeParse(output).success).toBe(true);
+  });
+});
+
+describe('the stored shape, which this refactor was not allowed to change', () => {
+  /**
+   * The stored profile shape, written out by hand.
+   *
+   * This is the safety net for the wire/stored split. `verify-evidence.js`,
+   * `compute-experience.js`, the evaluation prompt's profile rendering,
+   * `screen-candidate.js`, the `parsed_profile` column and every dashboard cell
+   * read this object. A derived expectation would only prove the code agrees
+   * with itself, so the expected value is a literal.
+   *
+   * **It changed this round, and here is exactly how.** It used to carry
+   * `headline` and `summary` between `location` and `statedYearsExperience`;
+   * both are gone. Three fields inside the nested shapes went with them -
+   * `workHistory[].isCurrent`, `education[].startDate` and `location.raw`.
+   * Nothing in the system read any of the five, and each was costing an optional
+   * parameter out of an API budget of 24. They were deleted from the stored
+   * shape rather than kept as permanently-null keys, because a field that can
+   * never be anything but null is dead weight in `parsed_profile` and reads to
+   * the next person like a bug. `parsed_profile` is jsonb, so no migration is
+   * involved either way.
+   */
+  const STORED_SHAPE = Object.freeze([
+    'fullName',
+    'email',
+    'phone',
+    'linkedinUrl',
+    'location',
+    'statedYearsExperience',
+    'workHistory',
+    'education',
+    'certifications',
+    'skills',
+  ]);
+
+  it('emits exactly these keys, in this order', () => {
+    // Order matters and is not incidental: the evaluation prompt renders this
+    // object with `JSON.stringify`, so a reshuffle would change the bytes sent to
+    // the model for an unchanged CV.
+    expect(Object.keys(normalizeProfile(profile()).profile)).toEqual(STORED_SHAPE);
+    expect(Object.keys(normalizeProfile(GOLDEN_EXTRACTED).profile)).toEqual(STORED_SHAPE);
+  });
+
+  it('emits exactly these keys inside each nested shape', () => {
+    const { profile: output } = normalizeProfile(GOLDEN_EXTRACTED);
+
+    expect(Object.keys(output.workHistory[0])).toEqual([
+      'employer',
+      'title',
+      'startDate',
+      'endDate',
+      'summary',
+    ]);
+    expect(Object.keys(output.education[0])).toEqual([
+      'institution',
+      'degree',
+      'field',
+      'level',
+      'endDate',
+    ]);
+    expect(Object.keys(output.location)).toEqual(['city', 'region', 'countryCode']);
+  });
+
+  it('fills every field the model left out with null, and an absent list with null', () => {
+    // The model omitting a field and the model sending an explicit null are one
+    // claim - "the CV does not say" - and this is where the second spelling is
+    // restored.
+    //
+    // Built by hand rather than through `profile()`, deliberately: the wire
+    // schema now *requires* the four lists, so a real response can no longer
+    // leave one out. The fill stays total anyway, because `profileSchema` still
+    // allows a null list and collapsing an absent key to `[]` here would
+    // manufacture a claim - "I looked and found nothing" - that nobody made.
+    expect(normalizeProfile({}).profile).toEqual({
+      fullName: null,
+      email: null,
+      phone: null,
+      linkedinUrl: null,
+      location: null,
+      statedYearsExperience: null,
+      workHistory: null,
+      education: null,
+      certifications: null,
+      skills: null,
+    });
+  });
+
+  it('turns the golden extraction into the golden profile, value for value', () => {
+    // The two fixtures are written out independently, so this is a real
+    // assertion rather than a round trip: `GOLDEN_PROFILE` is what phase 2a's
+    // scoring tests, the redaction tests and the prompt tests all read, and it
+    // is unchanged.
+    const { computedYearsExperience, skills, ...stored } = GOLDEN_PROFILE;
+    const expected = {
+      ...stored,
+      // `evidenceVerified` is added later, by `verify-evidence.js`.
+      skills: skills.map(({ evidenceVerified, ...skill }) => skill),
+    };
+
+    const { profile: output, changes } = normalizeProfile(GOLDEN_EXTRACTED);
+
+    expect(output).toEqual(expected);
+    expect(changes).toEqual([]);
+    expect(profileSchema.safeParse(output).success).toBe(true);
+  });
+
+  it('keeps an empty list empty, because that is a claim the model made', () => {
+    // `[]` is "the model looked and found nothing", and since the four lists
+    // became required on the wire it is the *only* way a response says that.
+    // Nothing here may quietly turn it back into a null.
+    const output = normalizeProfile(profile()).profile;
+
+    expect(output.workHistory).toEqual([]);
+    expect(output.education).toEqual([]);
+    expect(output.certifications).toEqual([]);
+    expect(output.skills).toEqual([]);
   });
 });
 
@@ -83,12 +216,12 @@ describe('email', () => {
     // all-or-nothing check here would null the whole extraction and burn a retry
     // over a field nobody scores on.
     const { profile: output } = normalizeProfile(
-      profile({ email: 'rubbish', fullName: 'A. Candidate', headline: 'Staff Engineer' }),
+      profile({ email: 'rubbish', fullName: 'A. Candidate', statedYearsExperience: 9 }),
     );
 
     expect(output.email).toBeNull();
     expect(output.fullName).toBe('A. Candidate');
-    expect(output.headline).toBe('Staff Engineer');
+    expect(output.statedYearsExperience).toBe(9);
   });
 });
 
@@ -124,12 +257,12 @@ describe('phone and linkedin', () => {
 describe('whitespace', () => {
   it('trims, collapses runs, and turns a blank string into null', () => {
     const { profile: output, changes } = normalizeProfile(
-      profile({ headline: '  Staff   Engineer  ', summary: '   ' }),
+      profile({ fullName: '  A.   Candidate  ', linkedinUrl: '   ' }),
     );
 
-    expect(output.headline).toBe('Staff Engineer');
-    expect(output.summary).toBeNull();
-    expect(changes).toContainEqual({ field: 'summary', action: 'nulled_empty' });
+    expect(output.fullName).toBe('A. Candidate');
+    expect(output.linkedinUrl).toBeNull();
+    expect(changes).toContainEqual({ field: 'linkedinUrl', action: 'nulled_empty' });
   });
 
   it('reaches into the list entries too', () => {
@@ -138,21 +271,14 @@ describe('whitespace', () => {
         workHistory: [
           {
             employer: '  Northwind   Logistics ',
-            title: null,
             startDate: ' 2021-03 ',
-            endDate: null,
-            isCurrent: true,
             summary: '',
           },
         ],
         education: [
           {
             institution: ' University  of Leeds ',
-            degree: null,
-            field: null,
             level: 'bachelors',
-            startDate: null,
-            endDate: null,
           },
         ],
       }),
@@ -167,10 +293,11 @@ describe('whitespace', () => {
 
 describe('lists', () => {
   it('keeps null as null and an empty array as an empty array', () => {
-    // "Extraction found no such section" and "extraction looked and found
-    // nothing" are different answers, and the schema was shaped to keep them
-    // apart.
-    const nulls = normalizeProfile(profile()).profile;
+    // "There is no such section in this profile at all" and "extraction looked
+    // and found nothing" are different answers, and `profileSchema` was shaped
+    // to keep them apart. Only the second is reachable from the wire now; the
+    // first is what the fill produces for anything else that reaches it.
+    const nulls = normalizeProfile({}).profile;
     expect(nulls.skills).toBeNull();
     expect(nulls.workHistory).toBeNull();
     expect(nulls.certifications).toBeNull();
@@ -186,8 +313,8 @@ describe('lists', () => {
     const { profile: output, changes } = normalizeProfile(
       profile({
         certifications: [
-          { name: ' ', issuer: null, issuedDate: null, expiryDate: null },
-          { name: '  RN Licence ', issuer: ' NMC ', issuedDate: null, expiryDate: '2027-01' },
+          { name: ' ' },
+          { name: '  RN Licence ', issuer: ' NMC ', expiryDate: '2027-01' },
         ],
       }),
     );
@@ -210,7 +337,7 @@ describe('skills', () => {
     const listedFirst = normalizeProfile(
       profile({
         skills: [
-          { name: 'Python', evidenceType: 'listed_only', evidenceQuote: null },
+          { name: 'Python', evidenceType: 'listed_only' },
           { name: 'python', evidenceType: 'demonstrated', evidenceQuote: 'built it in Python' },
         ],
       }),
@@ -220,7 +347,7 @@ describe('skills', () => {
       profile({
         skills: [
           { name: 'Python', evidenceType: 'demonstrated', evidenceQuote: 'built it in Python' },
-          { name: 'python', evidenceType: 'listed_only', evidenceQuote: null },
+          { name: 'python', evidenceType: 'listed_only' },
         ],
       }),
     ).profile.skills;
@@ -238,8 +365,8 @@ describe('skills', () => {
     const skills = normalizeProfile(
       profile({
         skills: [
-          { name: 'Java', evidenceType: 'listed_only', evidenceQuote: null },
-          { name: 'JavaScript', evidenceType: 'listed_only', evidenceQuote: null },
+          { name: 'Java', evidenceType: 'listed_only' },
+          { name: 'JavaScript', evidenceType: 'listed_only' },
         ],
       }),
     ).profile.skills;
@@ -251,8 +378,8 @@ describe('skills', () => {
     const { changes } = normalizeProfile(
       profile({
         skills: [
-          { name: 'SQL', evidenceType: 'listed_only', evidenceQuote: null },
-          { name: 'SQL', evidenceType: 'listed_only', evidenceQuote: null },
+          { name: 'SQL', evidenceType: 'listed_only' },
+          { name: 'SQL', evidenceType: 'listed_only' },
         ],
       }),
     );
@@ -281,7 +408,7 @@ describe('skills', () => {
 
   it('drops a skill whose name is only whitespace', () => {
     const { profile: output, changes } = normalizeProfile(
-      profile({ skills: [{ name: '   ', evidenceType: 'listed_only', evidenceQuote: null }] }),
+      profile({ skills: [{ name: '   ', evidenceType: 'listed_only' }] }),
     );
 
     expect(output.skills).toEqual([]);
@@ -293,24 +420,36 @@ describe('skills', () => {
   });
 });
 
-describe('location and stated years', () => {
+describe('location, which the model sends flat and the system stores nested', () => {
+  it('re-nests the four flat fields into the object everything downstream reads', () => {
+    // The flattening is a wire decision - a nested nullable object cost five of
+    // the sixteen union-typed parameters the API allows. `elimination.js` still
+    // reads `profile.location.countryCode`, and this is what keeps that true.
+    const { profile: output } = normalizeProfile(
+      profile({ locationCity: 'Manchester', locationCountryCode: 'GB' }),
+    );
+
+    expect(output.location).toEqual({
+      city: 'Manchester',
+      region: null,
+      countryCode: 'GB',
+    });
+  });
+
   it('upper-cases a country code and nulls anything that is not ISO alpha-2', () => {
     expect(
-      normalizeProfile(profile({ location: { raw: null, city: null, region: null, countryCode: 'gb' } }))
-        .profile.location.countryCode,
+      normalizeProfile(profile({ locationCountryCode: 'gb' })).profile.location.countryCode,
     ).toBe('GB');
 
     const { profile: output, changes } = normalizeProfile(
-      profile({
-        location: { raw: ' Manchester, UK ', city: null, region: null, countryCode: 'United Kingdom' },
-      }),
+      profile({ locationCity: ' Manchester ', locationCountryCode: 'United Kingdom' }),
     );
 
     // "United Kingdom" would silently never match an allowlist of alpha-2 codes.
     // A null makes the rule indeterminate and flags the candidate for a human,
     // which decision 7-C says is the right failure.
     expect(output.location.countryCode).toBeNull();
-    expect(output.location.raw).toBe('Manchester, UK');
+    expect(output.location.city).toBe('Manchester');
     expect(changes).toContainEqual({
       field: 'location.countryCode',
       action: 'nulled_invalid',
@@ -318,23 +457,24 @@ describe('location and stated years', () => {
     });
   });
 
-  it('leaves a null location alone', () => {
-    expect(normalizeProfile(profile({ location: null })).profile.location).toBeNull();
+  it('produces a null location when the model gave none of the three fields', () => {
+    // The same answer the nested shape used to give as an explicit
+    // `location: null`: this CV states no location at all.
+    expect(normalizeProfile(profile()).profile.location).toBeNull();
   });
 
   it('keeps a location whose country the model could not determine', () => {
-    // A present location with a null country is the ordinary case for a CV that
-    // says "Remote" or "North West". It is not an error and produces no change
-    // record - the allowlist rule will read it as indeterminate, which is what
-    // decision 7-C asks for.
+    // One field present is enough to make the object real. A CV that names a
+    // region and no country is the ordinary case, not an error: it produces no
+    // change record, and the allowlist rule reads it as indeterminate, which is
+    // what decision 7-C asks for.
     const { profile: output, changes } = normalizeProfile(
-      profile({ location: { raw: 'Remote', city: null, region: null, countryCode: null } }),
+      profile({ locationRegion: 'North West England' }),
     );
 
     expect(output.location).toEqual({
-      raw: 'Remote',
       city: null,
-      region: null,
+      region: 'North West England',
       countryCode: null,
     });
     expect(changes).toEqual([]);
@@ -349,7 +489,7 @@ describe('location and stated years', () => {
       .statedYearsExperience).toBe(expected);
   });
 
-  it.each([[-1], [81], [Number.NaN], [Number.POSITIVE_INFINITY]])(
+  it.each([[-1], [81], [Number.POSITIVE_INFINITY]])(
     'nulls an implausible stated total (%s)',
     (value) => {
       const { profile: output, changes } = normalizeProfile(
@@ -364,4 +504,20 @@ describe('location and stated years', () => {
       });
     },
   );
+
+  it('nulls a NaN the schema would never have let through', () => {
+    // Deliberately built by hand rather than through `profile()`: `z.number()`
+    // rejects NaN, so this value cannot reach normalization from a real
+    // response. The `Number.isFinite` check stays and stays tested anyway,
+    // because this function is the last thing standing between a stray number
+    // and a figure a recruiter reads next to a real one.
+    const { profile: output, changes } = normalizeProfile({ statedYearsExperience: Number.NaN });
+
+    expect(output.statedYearsExperience).toBeNull();
+    expect(changes).toContainEqual({
+      field: 'statedYearsExperience',
+      action: 'nulled_invalid',
+      reason: 'implausible',
+    });
+  });
 });

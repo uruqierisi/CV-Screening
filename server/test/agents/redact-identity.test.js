@@ -42,7 +42,11 @@ describe('redactIdentity', () => {
     expect(redacted.skills).toEqual(GOLDEN_PROFILE.skills);
     expect(redacted.location).toEqual(GOLDEN_PROFILE.location);
     expect(redacted.computedYearsExperience).toBe(GOLDEN_PROFILE.computedYearsExperience);
-    expect(redacted.headline).toBe(GOLDEN_PROFILE.headline);
+    // The free text that carries the evidence a criterion is rated on. The
+    // profile-level `headline` and `summary` used to be checked here too; both
+    // were deleted from the schema, which narrowed this module's honest limit
+    // without anybody aiming at it - see its header.
+    expect(redacted.workHistory[0].summary).toBe(GOLDEN_PROFILE.workHistory[0].summary);
   });
 
   it('returns a copy and leaves the original whole', () => {
