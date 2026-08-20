@@ -1,0 +1,20 @@
+# Line-ending policy.
+#
+# The default is normalisation: text files are stored with LF and checked out in
+# whatever the platform wants. That is right for source, and wrong for the two
+# directories below, where the *bytes* are the fixture.
+* text=auto
+
+# Byte-exact document fixtures. `fixtures.test.js` asserts that what is committed
+# here equals what `build-documents.js` produces, byte for byte - and `cv.txt`
+# deliberately carries CRLF line endings, because it exists to exercise the TXT
+# parser's newline normalisation. Under the default policy Git strips those CRLFs
+# on commit, the committed file stops being what the generator produces, and a
+# fresh clone fails two tests before the reviewer has done anything wrong.
+#
+# `-text` disables the conversion in both directions: stored verbatim, checked
+# out verbatim.
+server/test/extraction/fixtures/documents/** -text
+
+# The reviewer-facing copies of the same files, for the same reason.
+samples/** -text

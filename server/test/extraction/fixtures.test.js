@@ -20,6 +20,17 @@ function committed(name) {
   return readFileSync(fileURLToPath(new URL(`./fixtures/documents/${name}`, import.meta.url)));
 }
 
+/**
+ * The same file as a reviewer sees it. `samples/` carries copies of these five
+ * fixtures so that the sample CVs are one directory off the repository root
+ * rather than four levels into a test tree.
+ *
+ * @param {string} name
+ */
+function sample(name) {
+  return readFileSync(fileURLToPath(new URL(`../../../samples/${name}`, import.meta.url)));
+}
+
 const EXPECTED_FIXTURES = ['clean.pdf', 'two-column.pdf', 'scanned.pdf', 'cv.docx', 'cv.txt'];
 
 describe('the document fixtures', () => {
@@ -46,6 +57,19 @@ describe('the document fixtures', () => {
 
     for (const name of EXPECTED_FIXTURES) {
       expect(committed(name).equals(built[name])).toBe(true);
+    }
+  });
+
+  it('matches the reviewer-facing copies in samples/, byte for byte', () => {
+    // `samples/README.md` tells a reviewer these files are the parser fixtures,
+    // and documents what each one demonstrates - the two-column interleave and
+    // the scanned-PDF failure among them. A copy that drifted from the fixture
+    // would make that documentation describe a file nobody is uploading, and
+    // the drift would be invisible: both files still parse, just differently.
+    const built = buildAllFixtures();
+
+    for (const name of EXPECTED_FIXTURES) {
+      expect(sample(name).equals(built[name]), name).toBe(true);
     }
   });
 
