@@ -113,7 +113,7 @@ reordering path the repository actually uses.
 
 | `type` | `value` | Profile fact | Predicate |
 |---|---|---|---|
-| `min_years_experience` | `{ years: int 0..60 }` | `computedYearsExperience` | `>=` |
+| `min_years_experience` | `{ years: int 0..60 }` | `computedYearsExperience` | `>=`, and **`indeterminate` when the value is `null`** — see below |
 | `required_skill` | `{ skill, matchMode: 'exact'\|'normalized', mustBeDemonstrated: bool }` | `skills[]` | token match; `mustBeDemonstrated` requires `evidenceType === 'demonstrated'` **after** quote verification |
 | `required_education_level` | `{ level }` | `education[]` | ordered ladder `none < high_school < associate < bachelors < masters < doctorate` |
 | `required_certification` | `{ name, matchMode }` | `certifications[]` | normalized name match, **and not stated-expired** — see below |
@@ -122,6 +122,22 @@ reordering path the repository actually uses.
 The union is **closed**: a rule type with no code evaluator cannot be stored, and an unknown
 type at evaluation time **throws** — it never silently passes. A unit test asserts the stored
 enum and the evaluator registry are the same set.
+
+**`min_years_experience` compares a number the dates support, or admits it has none.**
+`computedYearsExperience` is `null` whenever the work history does not determine an answer, and
+a null reads as **`indeterminate`** — never as zero, and never as a figure closed at `now` out
+of an entry the CV left open. The rule that decides which absent end dates are "still there" is
+in §5.1 and in the header of `compute-experience.js`; what §2 needs to record is the predicate's
+third branch and the fact that the recruiter-facing detail *names the entry that caused it*:
+
+> years of experience could not be determined from the CV: `"Staff Nurse" at "Mercy General"
+> (started 2016-01) has no end date, and a later role starts after it, so its end is unknown`
+> (rule asks for 5 years)
+
+`on_missing` then decides, exactly as it does for every other unknown fact. The detail it
+replaced — *"10.7 years computed from dates, minimum 5"* — was the worst possible output: a
+number nothing measured, phrased as a measurement, on a rule that had just passed a candidate
+whose CV showed one twelve-month job.
 
 **`required_certification` reads expiry, and this is why `{ now }` exists.** A name match
 alone would let a lapsed licence satisfy a rule that says "current". The seed's own rule —
@@ -418,14 +434,212 @@ agents/
 
 ### 5.1 Schemas — shaped for the model, not the type checker
 
-- **`.nullable()` everywhere, `.optional()` nowhere.** A nullable-but-required field forces an
-  explicit per-field decision and distinguishes "the CV doesn't say" from "the model stopped
-  generating". That distinction *is* the anti-fabrication story.
+- **Two profile shapes: `.optional()` on the wire, `.nullable()` in storage — and a field set
+  cut to fit two independent API budgets.** This reverses the original rule — *".nullable()
+  everywhere, .optional() nowhere"* — and the reversal was forced, not preferred.
+
+  Two live requests during phase 2b were rejected before they reached the model, one after the
+  other. Both messages are quoted verbatim, because a paraphrase of an API limit is how the
+  next one gets missed:
+
+  > `400 invalid_request_error` — "Schemas contains too many parameters with union types (32
+  > parameters with type arrays or anyOf). This causes exponential compilation cost. Reduce
+  > the number of nullable or union-typed parameters (limit: 16 parameters with unions)."
+
+  > `400 invalid_request_error` — "Schemas contains too many optional parameters (31), which
+  > would make grammar compilation inefficient. Reduce the number of optional parameters in
+  > your tool schemas (limit: 24)."
+
+  The API compiles the output JSON Schema into a decoding grammar. A union costs it
+  exponentially; an optional parameter costs it a branch. **They are two separate caps —
+  unions ≤ 16, optionals ≤ 24 — and a field can only ever be one of three things:**
+
+  | Marking | Union budget | Optional budget |
+  |---|---|---|
+  | `.nullable()` | 1 | 0 |
+  | `.optional()` | 0 | 1 |
+  | required | 0 | 0 |
+
+  The first 400 was fixed by trading every `.nullable()` for `.optional()` and flattening
+  `location` (nested, it cost five unions on its own). That took unions from 32 to **0** and
+  walked straight into the second cap at **31 optionals**. Only *required* is free, and that
+  is what shaped everything below.
+
+  **The rule that decided which fields moved**, and it is the load-bearing sentence of this
+  whole section:
+
+  > Required costs neither budget, but a required scalar forces the model to produce something
+  > even when the CV does not have it — and invention is what this design exists to prevent.
+  > So **`required` is for fields where absence has a safe representation**, and **deletion is
+  > for fields nothing scores.**
+
+  Applied, 31 → 22:
+
+  | Step | Change | Optionals |
+  |---|---|---|
+  | 0 | after the union fix | 31 |
+  | 1 | `workHistory`, `education`, `certifications`, `skills` **required** — `[]` is a legitimate "I looked and found none" | 27 |
+  | 2 | `workHistory[].isCurrent` **deleted** — an absent `endDate` already means ongoing | 26 |
+  | 3 | `headline` **deleted** — nothing scores it | 25 |
+  | 4 | `locationRaw` **deleted** — `location_allowlist` reads `countryCode` only | 24 |
+  | 5 | profile-level `summary` and `education[].startDate` **deleted** — nothing reads either | **22** |
+
+  Step 5 exists because 24 is the cliff edge and a schema sitting exactly on a limit fails on
+  the next field somebody adds — which is precisely how the second 400 happened. Two spare is
+  cheap when the price is only fields nothing reads.
+
+  **What was deliberately not touched.** `employer` and `title` stay optional: they are what a
+  badly-parsed CV loses first, and requiring a string for one is requiring an invented
+  employer. `workHistory[].summary` and `skills[].evidenceQuote` stay optional for the
+  opposite reason — they carry the evidence the whole evaluation rests on.
+
+  **The five deleted fields left the stored schema too**, rather than surviving there as
+  permanently-null keys. A field that can never be anything but null is dead weight in
+  `parsed_profile`, an empty column on the dashboard, and a trap for the next reader who
+  assumes something fills it. `parsed_profile` is jsonb, so no migration is involved either
+  way. The one that came closest to staying was `location.raw`: a recruiter-facing "Remote"
+  string has display value even though no rule reads it — but with the wire field gone there
+  is no longer any way to populate it, which makes keeping it exactly the dead weight above.
+
+  **Two encodings of one fact became one.** `isCurrent` was tri-state beside `endDate`, and an
+  entry with neither used to be discarded as unusable — throwing away the ordinary "March 2021
+  –" current role. `isCurrent` was deleted and **an absent `endDate` became the only way to say
+  "this has not ended"**, which the extraction prompt states in those words.
+
+  **And the first version of that reading was wrong, in a way worth writing down.** Every
+  absent `endDate` was closed at `now`. Probed with an injected clock at `2026-08-20`:
+
+  | Work history | computed | `min_years_experience ≥ 5` |
+  |---|---|---|
+  | current role, 2021-03 → `null` | 5.5 | pass — correct |
+  | **finished role, 2016-01 → `null`, with a later role after it** | **10.7** | **pass — wrong** |
+  | the same role with its end date, 2016-01 → 2017-01 | 1.1 | fail — correct |
+  | **one summer internship, 2015-06 → `null`, with a later role after it** | **11.3** | **pass — wrong** |
+
+  The same twelve-month job read 1.1 years and failed the gate with its end date present, and
+  10.7 years and passed with the end date missing — and the elimination detail said *"10.7 years
+  computed from dates, minimum 5"*, which reads as verified fact with nothing marking it as
+  manufactured. A confident wrong number is worse than an admitted gap.
+
+  **The rule now, and it is the whole of it:** an entry with `endDate === null` is **current,
+  and closes at `now`, if and only if no other entry in the work history starts strictly
+  later.** A CV lists roles as a sequence; if another role starts after this one, this one
+  ended, whatever the CV forgot to say. Entries **tied** at the latest start are concurrent
+  current roles, not an ambiguity, and all of them close at `now`.
+
+  Otherwise the absent end is an extraction gap and **`computedYearsExperience` is `null` — the
+  whole value, not just that entry.** Dropping the entry and totalling the rest would
+  undercount, which is the same crime in the other direction. An unknown fact then takes the
+  7-C path it takes everywhere else: `indeterminate`, a reason naming the offending entry, and
+  `on_missing` deciding (§2).
+
+  **One exception, because it costs nothing to be right.** If the intervals that *are*
+  resolvable already cover the span from the unresolvable entry's start through `now`, then
+  whatever its true end date the merged union is unchanged, so the answer stays determinate and
+  is returned. Without it, a CV with contiguous or overlapping roles would go indeterminate over
+  a gap that provably cannot change the total — a false alarm, and false alarms train a
+  recruiter to ignore the badge.
+
+  Everything else about `endDate` is unchanged: an explicit "Present"/"Current" is still
+  current whatever its position in the list, a future end still clamps to `now`, and an
+  unparseable end is still its own `unusable` reason.
+
+  The honest cost, recorded rather than hidden: a CV listing a genuine current role *before* a
+  later short contract — or listing a role that starts in the future — now yields `null` where
+  the old code yielded a number. Nobody is eliminated by that on the default `on_missing`, and
+  the recruiter is told which entry to look at. That is the direction 7-C asks for.
+
+  **An explicit `null` on the wire is accepted, not rejected.** Every optional field is wrapped
+  in a `z.preprocess` that reads `null` as an absent key. This is not silent repair of an
+  error: on this contract `null` and absent are the same claim, and `normalize-profile.js`
+  fills absent with `null` a line later anyway — failing validation and burning a retry over an
+  equivalent encoding would be brittle for no benefit. It costs **nothing on either budget**
+  (`zod-to-json-schema` emits the input side of a preprocess, so the bytes on the wire are
+  unchanged), and the budget test measures the generated schema rather than the source, so
+  that claim is checked rather than asserted. The four required lists are **not** wrapped:
+  there is no "absent" for a `null` to be equivalent to, so one there is a real mismatch and
+  takes the ordinary semantic retry.
+
+  **The property this section was written to protect is unchanged.** The point was never
+  `null` specifically; it was that the model must have a legal, cheap, explicitly-blessed way
+  to say "the CV does not say this" instead of inventing something plausible. *A field the
+  model omits says that exactly as well as an explicit null*, and an empty list says it for a
+  section. The extraction prompt (now **2.0.0**) authorises both in the same words it used to
+  authorise `null` — a major bump, because this is a different output document rather than the
+  same one worded differently, and comparing two profiles by version is the reason the version
+  is stored beside the extraction at all.
+
+  The counter-argument, recorded rather than hidden: an omitted field is ambiguous between
+  "not in the CV" and "the model stopped generating". It is weak — a truncated generation is
+  already caught by `stop_reason: max_tokens` before the response is ever parsed — and it is
+  moot, because the alternative design cannot make a request at all.
+
+  **Downstream sees one shape.** `normalize-profile.js` is the seam: it fills every absent
+  field with `null` and re-nests the location, so `profileSchema`, the `parsed_profile`
+  column, `verify-evidence.js`, `compute-experience.js`, `elimination.js`, the evaluation
+  prompt's profile rendering and every dashboard cell read one object. A test asserts that
+  object key for key, in order, against a literal written out by hand — and it was **changed
+  deliberately this round**, not allowed to drift: `headline` and `summary` left the top level,
+  `isCurrent` left `workHistory[]`, `startDate` left `education[]`, and `raw` left `location`.
+
+  Which fields kept `.nullable()` on the wire: **none.** The evaluation schema keeps its two
+  (`evidence`, `summary`), which is where a null *is* an assertion, and at 2 unions and **0
+  optionals** it is nowhere near either cap.
+
+  **Postscript, added after the bisect in §5.2.1: the extraction schema is no longer sent.**
+  Everything above is kept because it is the record of how this schema got its shape, and
+  because `extractedProfileSchema` is still the thing every extraction is validated against —
+  but the request that carried it no longer does. The API's grammar compiler could not compile
+  it in a usable time *even at 0 unions and 22 optionals*, so the two caps below were never
+  what stopped it.
+
+  Three consequences, stated so nobody has to infer them:
+
+  - **The budgets no longer bind extraction.** A field added to the wire contract costs
+    nothing at the API now. What it still costs is everything else in this section — a
+    required scalar the CV may not have is still an invitation to invent, and a field nothing
+    reads is still a column nobody fills.
+  - **The five deleted fields stay deleted**, and three of them were re-argued on their own
+    merits rather than on the budget: `locationRaw` (nothing populates it), profile-level
+    `summary` (a name-leak surface into the judge, which is a better reason than the budget
+    ever was), and `workHistory[].isCurrent` (two encodings of one fact is a drift surface
+    whatever the cap). `education[].startDate` and `headline` are open, and are the subject of
+    a recommendation rather than a change.
+  - **`.optional()` on the wire is now a choice, not a forced move.** It is kept, because the
+    property it buys was never about the budget: the model must have a legal, cheap,
+    explicitly-blessed way to say "the CV does not say this", and an omitted key says it.
+
+  **The real gap both 400s exposed was a missing test, not a wrong schema.** 702 tests passed
+  against a fake client that applies no compilation limit, and the first version of the test
+  that followed guarded one cap because one 400 had revealed one cap — the wrong unit, since a
+  test should own the *class* of failure rather than the instance.
+  `test/agents/schema-budget.test.js` walks the generated JSON Schema for every schema this
+  system sends and counts **both**: union-typed parameters (a `type` array, an `anyOf` or a
+  `oneOf`, at any depth) and optional parameters (any property its own object's `required` does
+  not name, recursively through array `items`). It reads the schema off the request the
+  injected client actually received, so it cannot drift from the call sites, and it asserts the
+  exact current counts as well as the ceilings — so a field pushing a schema *toward* a cap
+  shows up in a diff on the day it lands.
+
+  Since §5.2.1 that means **the evaluation schema**, which is the only one now sent. The
+  extraction assertions were retired rather than weakened — a budget on a schema that never
+  leaves the process is a fiction — and what replaced them is the assertion that the extraction
+  request carries no `output_config.format` at all. That is the fact worth guarding, because
+  reinstating one would not fail loudly; it would hang for two minutes per candidate and read
+  as a network fault. And the honest scope of the file is now written into its header: it
+  catches the two caps the API documents, not the compilation cost it does not.
+
+  **`test/agents/schema-drift.test.js`** guards the surface the wire/stored split created: a
+  field added to one schema and forgotten on the other never arrives, and nothing throws. It
+  compares the two field sets in both directions, minus a literal list of the two fields the
+  wire deliberately drops — `computedYearsExperience` and `skills[].evidenceVerified`, both
+  written by code after the model has answered, and both left off the wire precisely so the
+  model has nowhere to put a value for them.
 - **`email` is a plain string, not `z.string().email()`.** Strict validation is all-or-nothing
   at the API boundary — one mangled OCR email would null the entire extraction and burn a
   retry over a field nobody scores on. Format checks live in `normalize-profile.js`, which
   nulls the bad field and keeps the other forty.
-- **`skills[].evidenceType: 'demonstrated' | 'listed_only'`** alongside a nullable `evidence`.
+- **`skills[].evidenceType: 'demonstrated' | 'listed_only'`** alongside an optional `evidenceQuote`.
   Redundant on paper; in practice a model handed a nullable string *fills it*, and a model
   handed an honest option *picks it*. This is the single most important schema decision.
 - **`skills[].evidenceQuote`** must be a **verbatim** span. `verify-evidence.js` normalizes
@@ -488,24 +702,138 @@ agents/
 
 **Years of experience:** the model returns only `statedYearsExperience` (what the CV literally
 claims). `compute-experience.js` derives `computedYearsExperience` from work-history dates with
-overlap merging and an injected `now`. Elimination rules read the computed value only. The
-stated value is kept as a discrepancy signal ("CV claims 10 years; dates support 6.5").
+overlap merging and an injected `now`, and returns **`null` whenever the dates do not determine
+a value** — including the open-end case above. Elimination rules read the computed value only,
+and read a `null` as `indeterminate`. The stated value is kept as a discrepancy signal ("CV
+claims 10 years; dates support 6.5"). Beside the number the module reports its working:
+`segments`, `unusable` entries with a reason each, and `undetermined` entries — the open-ended
+ones that are not current, each naming its employer, title and start date, and each flagged
+with whether the other roles already cover it.
 
 ### 5.2 Prompts
 
 Exported template functions returning `{ system, user }`. No branching beyond interpolation.
-Both go through `messages.parse` with `output_config: { format: zodOutputFormat(Schema), effort }`.
-No prefill (400 on Opus 5); thinking stays adaptive.
+No prefill (400 on Opus 5); thinking stays adaptive. **The two calls no longer ask for their
+JSON the same way**, and that is the subject of the next subsection:
+
+| Call | Request | Response read from | SDK method |
+|---|---|---|---|
+| Evaluation | `output_config: { format, effort: 'high' }` | `parsed_output` | `messages.parse` |
+| Extraction | `output_config: { effort: 'low' }` — no format | the text block, parsed in `client/json-response.js` | `messages.create` |
+
+#### 5.2.1 Structured output: kept for evaluation, dropped for extraction
+
+The schema-budget work in §5.1 was correct and got both measurable caps green — **0 unions
+against 16, 22 optionals against 24**. Extraction still failed. It was bisected against the
+live API, and the result is the reason this subsection exists:
+
+| Schema sent | Result |
+|---|---|
+| 8 optional scalars, no arrays | accepted |
+| 8 scalars + one **3**-property array | **accepted, 3.4s** |
+| 8 scalars + one **8**-property array | timeout > 60s |
+| 8 scalars + two arrays (the second only 2 properties) | timeout > 60s |
+| 8 scalars + `skills` + `workHistory` | timeout > 120s |
+| the real `extractedProfileSchema` | timeout > 120s; earlier, a fast `400 "Schema is too complex."` |
+
+A control answering in 3.4 seconds in the same run rules out a network fault. So the binding
+constraint is **grammar-compilation complexity**, and it has three properties that make it
+different in kind from the two caps in §5.1:
+
+- **it sits far below the documented limits** — this schema is under both, comfortably;
+- **it is unmeasurable from outside** — there is no counter to write a test against, which is
+  why `schema-budget.test.js` would never have caught it and does not claim to;
+- **it surfaces inconsistently** — sometimes as a fast 400, sometimes as a hang past the
+  120s call timeout, which reads as a network problem to everyone who sees it first.
+
+**Decision: extraction sends no schema; evaluation keeps its grammar.** Two reasons, recorded
+because a reviewer will ask and *"we tried it, measured where it breaks, and changed course"*
+is the answer.
+
+**1. The guarantee was always zod's.** §5.1 originally claimed constrained decoding made
+inventing a criterion structurally impossible, and that claim was already corrected there: the
+SDK's JSON-Schema transform demotes `enum` into the field's `description`, so enforcement was
+*always* post-parse validation. Extraction's structured output was therefore buying much less
+than this section assumed — and it was the thing blocking the pipeline. What actually protects
+the profile is unchanged and is all still in place: `extractedProfileSchema` validates every
+response, `.strict()` rejects an invented key, a mismatch feeds the failing paths back on the
+single semantic retry (§5.4), and a second bad response fails the candidate.
+
+**2. The grammar stays where it pays.** Extraction is *transcription* — the model is copying
+facts out of a document, and a grammar constrains the punctuation of that, not the judgement.
+The task where a decoding grammar earns its compilation cost is *structured reasoning*, which
+is evaluation: 2 unions, 0 optionals, no arrays of objects, and it compiles and answers today.
+So the grammar goes where it does not pay and stays where it does.
+
+What is given up, stated plainly: the API no longer guarantees extraction's response is shaped
+like the schema, so a malformed body is now possible where it previously was not. It costs a
+retry when it happens, it is bounded by the same `SEMANTIC_RETRIES = 1` as everything else, and
+`invalid_json` was already a row in the §5.4 matrix — a grammar-decoded response that never
+arrived looked exactly the same. **No second retry mechanism was added.**
+
+What replaces the grammar is prompt text (below) and two lines of defensive parsing: a leading
+markdown code fence is stripped before the body is parsed, because a model told not to emit one
+occasionally does and three backticks are not worth a whole generation. A *preamble* is
+deliberately **not** repaired — hunting for the first `{` would rescue today's response while
+hiding a model that is drifting, so it fails as `invalid_json`, takes the retry with the
+correction attached, and is visible in the logs.
+
+Cost and latency: unchanged calls per document (2), plus roughly 250 output-schema-shaped tokens
+of extra *input* on the extraction call for the shape block, minus whatever the API charged for
+compiling a grammar. The material change is that extraction now completes at all.
+
+`test/agents/schema-budget.test.js` keeps both counters and keeps owning the evaluation schema —
+the caps are real and still shape it. Its extraction assertions were **retired rather than
+weakened**, and replaced by the one fact now worth guarding: that this request carries no schema.
+Reinstating one would not fail loudly; it would hang for two minutes per candidate.
 
 **Extraction** sees the CV only — no role, no criteria — or the profile becomes role-flattering.
 CV text goes last, in `<cv>…</cv>` tags. Effort `low`: this is transcription, and thinking on a
 transcription task is billed output tokens spent on nothing. Load-bearing lines:
 
-> "Every field may be `null`. `null` is a correct answer, not a failure."
+> "Omitting a field is a correct answer, not a failure."
+> "`workHistory`, `education`, `certifications` and `skills` are always part of your answer.
+> When the CV has no such section, send an empty list."
+> "Leave `endDate` out of a work-history entry when the candidate is still in that role."
 > "Use `demonstrated` only when the CV describes the skill being *used*… When `evidenceType` is
 > `demonstrated`, copy `evidenceQuote` verbatim — character for character."
 
+The first line said `null` until prompt version 1.1.0; the second and third arrived with 2.0.0.
+All three changed with the schema, not independently of it. An instruction to send `null`
+against a schema with no place for one, an instruction to omit a list the schema requires, or
+silence about what a missing `endDate` now means, are all the same failure: the model being
+told one thing and validated — or read — against another.
+
 The wording names the honest option first and makes the dishonest one *more work*.
+
+**Version 2.1.0 carries what the grammar used to.** With no schema on the request (§5.2.1),
+two things the decoder did for free became prompt text, and they are the load-bearing addition:
+
+- **the exact shape**, written out key by key as a JSON skeleton, with the four always-present
+  lists and the three always-present entry fields named in prose underneath, because the model
+  no longer sees a `required` array;
+- **JSON and nothing else**: `"Return that object and nothing else. No preamble, no
+  explanation, no commentary after it, and no markdown code fence around it. The first
+  character you write is the opening brace and the last is the closing brace."`
+
+The skeleton is hand-written rather than generated from the zod schema: a generated JSON Schema
+is a document for a compiler, and pasting one in spends hundreds of tokens teaching the model to
+read `additionalProperties: false` instead of showing it the answer. That costs a drift risk,
+and the risk is paid off in `prompts.test.js`, which walks `extractedProfileSchema` and fails if
+the block names a field the schema does not define or omits one it does, in either direction.
+The two enums are interpolated from `constants.js` for the same reason.
+
+Extraction stopped using the shared `outputContractRule()` at 2.1.0 — that fragment tells the
+model its answer is checked against "the provided schema", which is now false on this call, and
+an instruction the model can see is false invites the rest of the prompt to be read as
+approximate. Evaluation still uses it.
+
+**A minor bump, not a major one**, and the distinction is the one 2.0.0 set: a major says *this
+is a different output document*. It is not. The field set, the absence convention, the `endDate`
+encoding and the evidence rules are unchanged, so a profile extracted under 2.0.0 and one
+extracted under 2.1.0 are comparable field for field — which is the entire reason the version is
+stored beside the extraction. What changed is how the shape reaches the model, and that can move
+outputs, which is why it is a bump at all.
 
 **Evaluation** sees the verified profile and the criteria. Effort `high`. It **withholds**:
 
@@ -571,7 +899,9 @@ one golden fixture run 100× asserting byte-identical JSON.
 ### 5.4 Client wrapper and failure taxonomy
 
 `new Anthropic({ apiKey, timeout, maxRetries: 2 })` — **TS SDK timeouts are milliseconds**.
-Non-streaming: outputs are schema-bounded and small. Two retry layers:
+Non-streaming: both outputs are small — one is schema-bounded by the API and one is bounded by
+`max_tokens` and a prompt (§5.2.1), and both are well inside the non-streaming ceiling even
+after a truncation retry doubles the budget. Two retry layers:
 
 **No `temperature`, and this is the answer to the variance question.** Checked against the
 Anthropic documentation on **2026-08-19**: `temperature`, `top_p` and `top_k` are **removed on
@@ -609,7 +939,17 @@ limitation is §8's, and it is unchanged by anything in this section.
 **`SEMANTIC_RETRIES = 1` is shared, not additive.** It is one budget for the whole response,
 not one per condition, and every semantic condition draws on the same allowance: a schema
 mismatch, a truncation, a non-JSON body, a summary that states a score, and an evaluation
-missing a criterion. So the obvious question — what happens when the summary is wrong *and* a
+missing a criterion.
+
+**Dropping structured output on extraction (§5.2.1) added no mechanism here.** `invalid_json`
+was already in this list — a grammar-decoded response that never arrived looked identical — so
+a model that answers in prose lands on the row that already existed, spends the same single
+retry, and gets the same correction appended. What changed is only *where the parse happens*:
+`client/json-response.js` finds the text block, strips a leading code fence, and runs the same
+zod schema, returning the same discriminated result the SDK's parser returns on the other path.
+Truncation, refusal, `no_output`, `unsupported_stop_reason`, context overflow and every
+transport row behave exactly as before, on both paths, and the suite asserts each of them
+twice. So the obvious question — what happens when the summary is wrong *and* a
 criterion is missing — has one answer: the response is rejected once, both faults are fed back
 in the same correction, and if the second response is still wrong the candidate fails. It never
 costs two retries.
@@ -631,12 +971,32 @@ responses. `stop_reason: 'refusal'` is **never** retried.
 
 Worker-side codes stored on the candidate: `EXTRACTION_FAILED`, `EMPTY_DOCUMENT`,
 `AGENT_TIMEOUT`, `AGENT_RATE_LIMIT`, `AGENT_UPSTREAM`, `AGENT_REFUSED`, `AGENT_BAD_OUTPUT`,
-`AGENT_INCOMPLETE_EVAL`, `AGENT_INPUT_TOO_LARGE`, `AGENT_INVALID_ROLE`, `AGENT_UNKNOWN_RULE`,
-`SOURCE_FILE_MISSING`.
+`AGENT_INCOMPLETE_EVAL`, `AGENT_INPUT_TOO_LARGE`, `AGENT_SCHEMA_REJECTED`,
+`AGENT_INVALID_ROLE`, `AGENT_UNKNOWN_RULE`, `SOURCE_FILE_MISSING`.
 
 `AGENT_INPUT_TOO_LARGE` was added during phase 2b and is not in the original list: a CV that
 overflows the context window is neither bad output nor an empty document, and collapsing it
 into either would tell a recruiter to fix the wrong thing.
+
+`AGENT_SCHEMA_REJECTED` was added after the smoke test in §5.1 and exists for the same reason
+turned inside out: the API rejected **our own output schema**, before the model saw the
+request. That is a permanent configuration fault in this repository — retrying never fixes it,
+and it fails every candidate in every batch identically — whereas `AGENT_UPSTREAM` tells
+whoever reads the log to look at the network, the rate limit or Anthropic's status page, all
+of which are the wrong place. **Not retryable.**
+
+Detection is the honest weak point and is documented as such in the code. Unlike context
+overflow, this failure carries no machine-readable `type` of its own: it arrives as a generic
+`invalid_request_error` distinguishable only by the prose in its message, and matching upstream
+prose is exactly what the rest of the client refuses to do. Two things bound that. A miss is
+not a regression — an unmatched 400 falls through to today's `AGENT_UPSTREAM` behaviour, so
+the failure mode is losing an improvement rather than breaking a behaviour, and a test asserts
+it. And the real defence sits before the network: the two-cap schema-budget test in §5.1 means
+this code path should never run at all. Since §5.2.1 it is narrower still — only the evaluation
+call sends a schema, so this is the only call that can be told its schema was rejected. It carries one signature id per known cap
+(`too_many_union_parameters`, `too_many_optional_parameters`) rather than one for "schema
+rejected", because the two send whoever reads the log to opposite edits — and trading one for
+the other is exactly what produced the second 400.
 Each carries a recruiter-safe `userMessage`; `detail` goes to logs and **never contains CV
 text** (asserted by planting a sentinel string in a fixture CV and scanning serialized errors).
 
@@ -759,6 +1119,33 @@ Rationale: the alternative silently drops every image-only, two-column and non-E
 Tier 3, where no human ever looks. That is a discrimination pattern with a purely technical
 cause. Cost, accepted: unqualified candidates reach Tier 2 and recruiters filter more.
 
+**A fact the code could *derive* is still a fact it can be missing, and this is where that was
+got wrong.** `min_years_experience` reads `computedYearsExperience`, which code computes rather
+than the model asserting — and computing it from an incomplete work history had been treated as
+always possible. It is not: an entry whose `endDate` the extraction lost has no end date to
+compute from, and closing it at `now` produced **10.7 years** out of a twelve-month job, passing
+a five-year gate on a number nothing measured (the probe table is in §5.1). The rule for reading
+an absent end date is in §5.1; what belongs *here* is the principle it was derived from:
+
+> An unknown fact is `indeterminate` whether the fact is **absent from the profile** or
+> **underdetermined by it**. A derived value that cannot be derived is missing in exactly the
+> sense this decision is about, and inventing a defensible-looking number for it is worse than
+> any of the failures 7-C was written to prevent — because a gap is visible and a plausible
+> number is not.
+
+Three consequences, all implemented:
+
+- `computedYearsExperience` is `null` when the dates do not determine it, and `null` is never
+  read as `0`. Zero would *fail* the rule; null makes it indeterminate.
+- The indeterminate detail says **why**, naming the entry — employer, title and start date — so
+  the recruiter can look at that line of the CV. "We could not tell" with no cause attached is a
+  badge nobody can act on.
+- The outcome reaches storage as its own thing. `elimination_details` carries every rule with
+  its `outcome`, the `indeterminate` subset, and a `hasIndeterminate` flag, so an unchecked
+  requirement renders differently from a satisfied one instead of collapsing into "not
+  eliminated". An eliminated-by-`on_missing` rule stays in the `indeterminate` list too: the
+  candidate was removed by a recruiter's policy, not shown to fail.
+
 **D. Identity redaction — in.** `evaluation/redact-identity.js` strips name, email, phone and
 linkedin from the profile before the *evaluation* call only. No criterion can legitimately
 reference them, so it costs no signal. Storage, the dashboard and the candidate detail view are
@@ -802,6 +1189,22 @@ README is in §4.
 - **The 85 and 65 thresholds are asserted, not validated.** Nobody has checked that 85
   corresponds to "strong" for a real recruiter. Validating it needs 30–50 labelled CVs and an
   offline agreement harness — worth more than any sampling machinery.
+
+  **First datapoint, recorded 2026-08-20.** A live end-to-end screening of a strong synthetic
+  backend CV — nine-plus years, demonstrated evidence on every core criterion, all three
+  elimination rules passed — scored **81.5** and landed in **Potential Match**, 3.5 points under
+  the threshold. Ratings were 9/7/9/7/8/8 across weights 30/20/20/15/10/5.
+
+  This is **not** evidence the threshold is wrong. It is one CV, written by us, scored once, and
+  the model's reasoning for each 7 was specific and defensible — it marked down API contract
+  mechanics and testing practice because the CV genuinely does not mention them. A rubric that
+  awards 85+ to a candidate with two named gaps may be behaving exactly as intended.
+
+  What it is: the first concrete instance of the question, and a calibration of how far off 85
+  a plainly strong candidate can land. What would settle it: the 30–50 labelled CVs above, with
+  a recruiter's own Strong/Potential/Unmatched label per CV, and agreement measured against the
+  computed tier. Until that exists, moving the threshold on one datapoint would be substituting
+  our intuition for theirs — which is the failure the harness exists to prevent.
 - **Extraction is a single point of failure.** Every rating, elimination and score depends on
   one non-deterministic call, and evaluation cannot see past it.
 - **Local disk means the API and worker must share a filesystem.** This does not scale
@@ -849,14 +1252,42 @@ buried at the end, so a reviewer reads it before forming a theory:
 
 ## 9. Cost
 
-Per candidate, `claude-opus-5` at $5/$25 per MTok: ~4,500 input + ~2,600 output ≈ **$0.088**,
-realistically $0.07–$0.15. 1,000 CVs ≈ **$90**.
+**Measured, not estimated.** One real candidate screened end to end against `claude-opus-5` on
+2026-08-20 — a 1,757-character CV, a six-criterion role, one attempt per call, no retries:
+
+| Stage | Input | Output |
+|---|---|---|
+| extraction (`effort: low`) | 3,183 | 1,330 |
+| evaluation (`effort: high`) | 5,006 | 1,826 |
+| **total** | **8,189** | **3,156** |
+
+At $5/$25 per MTok that is **$0.12 per candidate** — $0.041 input, $0.079 output. 1,000 CVs
+≈ **$120**.
+
+The original estimate below was ~4,500 input + ~2,600 output ≈ $0.088, "realistically
+$0.07–$0.15". The total landed inside that range, but **input ran 1.8× the estimate** and that
+is the number to plan against: the extraction prompt carries a hand-written JSON skeleton since
+§5.2.1 dropped the grammar (~+450 tokens), and the whole verified profile is serialized into the
+evaluation call. Output was close. One measurement is not a distribution — a longer CV or a
+ten-criterion role moves both numbers — but it beats an estimate, and re-measuring is one script.
 
 Biggest lever already applied: extraction at `effort: low` (thinking is ~60% of extraction's
-output tokens at high effort and buys nothing on a transcription task). Available later: the
-Batch API at 50% off for bulk uploads; Haiku 4.5 for extraction (~$0.045 total) — but not
-without measuring fabrication rate first, since extraction is precisely the fabrication-sensitive
-step. Prompt caching probably will **not** pay: the stable prefix is ~900 tokens, under the
+output tokens at high effort and buys nothing on a transcription task).
+
+**The largest lever not yet pulled: run extraction on a cheaper model.** Extraction is
+*transcription* — copy what the CV says into fields, and say nothing where it says nothing. It
+is the same argument §5.2.1 used to drop constrained decoding for extraction while keeping it
+for evaluation: the reasoning happens in the evaluation call, and that is the one that has to be
+the strongest model available. On the measured split, extraction is 3,183 in / 1,330 out —
+about 39% of input and 42% of output — so moving it to Haiku 4.5 ($1/$5) takes the per-candidate
+cost from **$0.12 to roughly $0.086**, near 30%.
+
+Documented as a lever, **not implemented**. Extraction is precisely the fabrication-sensitive
+step, and the whole design rests on the profile being an honest transcript: `verify-evidence.js`
+can falsify a quote but nothing catches a plausible invented employer. Pulling this lever needs
+a measured fabrication rate on a labelled set first — the same harness §8 wants for the tier
+thresholds — not an assumption that a cheaper model transcribes as faithfully. Also available:
+the Batch API at 50% off for bulk uploads. Prompt caching probably will **not** pay: the stable prefix is ~900 tokens, under the
 ~1,024-token minimum, and input is only ~26% of the bill.
 
 ---
