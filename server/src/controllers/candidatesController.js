@@ -37,6 +37,10 @@ export async function getCandidates(request, reply) {
     jobId: query.jobId,
     fitCategory: query.fitCategory,
     status: query.status,
+    // Parsed to an array of the same enum by the boundary schema, or left
+    // undefined. Nothing below this line ever sees the raw comma-separated
+    // string.
+    statusIn: query.statusIn,
   });
 
   return reply.send(

@@ -27,11 +27,15 @@ import {
  * @property {string} mimeType
  * @property {number} byteSize
  *
+ * @typedef {'pending'|'parsing'|'evaluating'|'done'|'failed'} CandidateStatus
+ *
  * @typedef {object} CandidateFilters
  * @property {string} [roleId]
  * @property {string} [jobId]
  * @property {'strong_match'|'potential_match'|'unmatched'} [fitCategory]
- * @property {'pending'|'parsing'|'evaluating'|'done'|'failed'} [status]
+ * @property {CandidateStatus} [status]
+ * @property {CandidateStatus[]} [statusIn] a set over the same column; composes
+ *   with `status` by AND, exactly as every other filter here composes
  */
 
 /**
@@ -64,6 +68,24 @@ function buildFilterClause(filters, startIndex = 1) {
   if (filters.status !== undefined) {
     conditions.push(`status = $${index++}`);
     params.push(filters.status);
+  }
+  if (filters.statusIn !== undefined) {
+    // `= ANY($n::text[])` over ONE bound array, never a comma-joined `IN (...)`
+    // built from the query string. Two properties follow from that and both are
+    // load-bearing:
+    //
+    //   - there is no string interpolation of a value anywhere on this path, so
+    //     the boundary enum is a defence in depth rather than the only one;
+    //   - the placeholder count does not depend on how many statuses were asked
+    //     for, so `nextIndex` - which LIMIT and OFFSET are numbered from - stays
+    //     correct for a one-element set and a five-element one alike. A
+    //     hand-built `IN ($4,$5,$6)` is exactly where that off-by-one lives.
+    //
+    // The cast is explicit because the driver sends a JS array as a Postgres
+    // array literal, and an untyped literal beside a `text` column is left for
+    // the planner to guess at.
+    conditions.push(`status = ANY($${index++}::text[])`);
+    params.push(filters.statusIn);
   }
 
   return {

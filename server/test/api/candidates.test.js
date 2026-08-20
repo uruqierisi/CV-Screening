@@ -151,6 +151,69 @@ describe('GET /api/v1/candidates', () => {
     });
   });
 
+  it('answers one request for "still working, plus failed" - the panel that used to be four', async () => {
+    const { roleId, ids } = await seedScoredCandidates();
+    await markCandidateParsing(pool, ids[3]);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/v1/candidates?roleId=${roleId}&statusIn=pending,parsing,evaluating,failed`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    // The dashboard was issuing four parallel filtered requests to build this
+    // list. Four requests to express one filter is the API being wrong.
+    expect(response.json().data.map((c) => c.id)).toEqual([ids[3]]);
+    expect(response.json().meta.total).toBe(1);
+  });
+
+  it('keeps the single status param working beside it', async () => {
+    const { roleId } = await seedScoredCandidates();
+
+    const single = await app.inject({
+      method: 'GET',
+      url: `/api/v1/candidates?roleId=${roleId}&status=done`,
+    });
+    const asSet = await app.inject({
+      method: 'GET',
+      url: `/api/v1/candidates?roleId=${roleId}&statusIn=done`,
+    });
+
+    expect(single.json().data.map((c) => c.id)).toEqual(asSet.json().data.map((c) => c.id));
+    expect(single.json().data).toHaveLength(3);
+  });
+
+  it('rejects a statusIn value outside the column CHECK', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/candidates?statusIn=done,queued',
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe('VALIDATION_FAILED');
+  });
+
+  it('rejects a statusIn longer than the vocabulary rather than growing the query', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/candidates?statusIn=done,done,done,done,done,done',
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe('VALIDATION_FAILED');
+  });
+
+  it('treats a statusIn injection attempt as a validation failure, not as SQL', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/v1/candidates?statusIn=${encodeURIComponent("done') OR '1'='1")}`,
+    });
+
+    expect(response.statusCode).toBe(400);
+    // And the table is still there, which the next assertion needs.
+    expect((await pool.query('SELECT count(*) FROM candidates')).rows[0].count).toBeDefined();
+  });
+
   it('rejects a sort value that is not one of the two ranking directions', async () => {
     const response = await app.inject({ method: 'GET', url: '/api/v1/candidates?sort=match_score' });
     expect(response.statusCode).toBe(400);

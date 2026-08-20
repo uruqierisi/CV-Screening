@@ -6,10 +6,12 @@ import {
 } from '../../src/schemas/role.schemas.js';
 import {
   CANDIDATE_STATUSES,
+  TERMINAL_CANDIDATE_STATUSES,
   candidateDetailQuerySchema,
   candidateStatusesQuerySchema,
   listCandidatesQuerySchema,
 } from '../../src/schemas/candidate.schemas.js';
+import { NON_TERMINAL_STATUSES } from '../../src/repositories/candidateStatusRepository.js';
 import {
   MAX_PAGE_SIZE,
   paginationMeta,
@@ -214,6 +216,98 @@ describe('listCandidatesQuerySchema', () => {
 
   it('rejects a roleId that is not a uuid', () => {
     expect(listCandidatesQuerySchema.safeParse({ roleId: 'all' }).success).toBe(false);
+  });
+});
+
+describe('the candidate status vocabulary', () => {
+  it('publishes the five values the column CHECK allows, in pipeline order', () => {
+    expect(CANDIDATE_STATUSES).toEqual(['pending', 'parsing', 'evaluating', 'done', 'failed']);
+  });
+
+  it('derives the terminal subset rather than listing it a second time', () => {
+    // The assertion that matters is not "it equals ['done','failed']" - a second
+    // literal would satisfy that on the day it was written. It is that terminal
+    // and non-terminal PARTITION the vocabulary: every status is classified, no
+    // status is classified twice, and the two lists between them account for
+    // every value the column can hold.
+    //
+    // A sixth status therefore cannot be added anywhere without this failing,
+    // which is the property `/config`'s `terminalStatuses` is worth publishing
+    // for. A polling client stops on that list; a list that quietly missed a new
+    // status would be a poll that never stops.
+    const partition = [...TERMINAL_CANDIDATE_STATUSES, ...NON_TERMINAL_STATUSES];
+
+    expect([...partition].sort()).toEqual([...CANDIDATE_STATUSES].sort());
+    expect(new Set(partition).size).toBe(CANDIDATE_STATUSES.length);
+  });
+
+  it('keeps the terminal subset in the vocabulary and in its order', () => {
+    expect(TERMINAL_CANDIDATE_STATUSES.every((s) => CANDIDATE_STATUSES.includes(s))).toBe(true);
+    expect(TERMINAL_CANDIDATE_STATUSES).toEqual(
+      CANDIDATE_STATUSES.filter((s) => TERMINAL_CANDIDATE_STATUSES.includes(s)),
+    );
+  });
+
+  it('is frozen, so no caller can edit the stop condition for everybody else', () => {
+    expect(Object.isFrozen(CANDIDATE_STATUSES)).toBe(true);
+    expect(Object.isFrozen(TERMINAL_CANDIDATE_STATUSES)).toBe(true);
+  });
+});
+
+describe('listCandidatesQuerySchema.statusIn', () => {
+  it('is absent by default, so nothing changes for a caller that does not send it', () => {
+    expect(listCandidatesQuerySchema.parse({}).statusIn).toBeUndefined();
+  });
+
+  it('splits, trims and validates a comma-separated set', () => {
+    expect(listCandidatesQuerySchema.parse({ statusIn: 'parsing, evaluating ,failed' }).statusIn)
+      .toEqual(['parsing', 'evaluating', 'failed']);
+  });
+
+  it('accepts a single value, which is the degenerate case of a set', () => {
+    expect(listCandidatesQuerySchema.parse({ statusIn: 'done' }).statusIn).toEqual(['done']);
+  });
+
+  it('accepts the whole vocabulary at once', () => {
+    expect(
+      listCandidatesQuerySchema.parse({ statusIn: CANDIDATE_STATUSES.join(',') }).statusIn,
+    ).toEqual([...CANDIDATE_STATUSES]);
+  });
+
+  it('rejects a value outside the column CHECK', () => {
+    // The enum is what makes `status = ANY($n)` safe upstream: nothing that is
+    // not one of five fixed strings can ever be in that array.
+    expect(listCandidatesQuerySchema.safeParse({ statusIn: 'done,queued' }).success).toBe(false);
+    expect(
+      listCandidatesQuerySchema.safeParse({ statusIn: "done','failed') OR 1=1--" }).success,
+    ).toBe(false);
+  });
+
+  it('rejects an empty list however it is spelled', () => {
+    expect(listCandidatesQuerySchema.safeParse({ statusIn: '' }).success).toBe(false);
+    expect(listCandidatesQuerySchema.safeParse({ statusIn: ',,' }).success).toBe(false);
+    expect(listCandidatesQuerySchema.safeParse({ statusIn: ' , ' }).success).toBe(false);
+  });
+
+  it('caps the set at the number of statuses that exist', () => {
+    // A repeated value is a client bug, not a reason for a bigger query. The cap
+    // is the vocabulary size, so the array bound to `= ANY($n)` can never be
+    // longer than the column's own CHECK - whatever the query string says.
+    const atCap = Array.from({ length: CANDIDATE_STATUSES.length }, () => 'done').join(',');
+    const overCap = Array.from({ length: CANDIDATE_STATUSES.length + 1 }, () => 'done').join(',');
+
+    expect(listCandidatesQuerySchema.safeParse({ statusIn: atCap }).success).toBe(true);
+    expect(listCandidatesQuerySchema.safeParse({ statusIn: overCap }).success).toBe(false);
+  });
+
+  it('coexists with the single status param, which it does not replace', () => {
+    // `status` is still in the contract and still means what it meant. Both
+    // filter one column and both are applied, composing with AND like every
+    // other pair of filters on this endpoint.
+    const parsed = listCandidatesQuerySchema.parse({ status: 'done', statusIn: 'done,failed' });
+
+    expect(parsed.status).toBe('done');
+    expect(parsed.statusIn).toEqual(['done', 'failed']);
   });
 });
 

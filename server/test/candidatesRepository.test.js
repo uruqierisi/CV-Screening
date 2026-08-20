@@ -3,6 +3,11 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { pool, truncateAll } from './helpers/database.js';
 import { candidateInput, createRole, createScreeningJob, driveCandidateToDone } from './helpers/fixtures.js';
 import { withTransaction } from '../src/db/withTransaction.js';
+import {
+  markCandidateEvaluating,
+  markCandidateFailed,
+  markCandidateParsing,
+} from '../src/repositories/candidateStatusRepository.js';
 import { insertCandidates } from '../src/repositories/candidatesRepository.js';
 import {
   countCandidates,
@@ -414,5 +419,192 @@ describe('candidateInput fixture', () => {
   it('produces a payload the schema accepts', async () => {
     const input = candidateInput();
     expect(input.contentSha256).toHaveLength(64);
+  });
+});
+
+describe('listRankedCandidates with statusIn', () => {
+  /**
+   * One candidate in each of the five statuses, so a set filter has something to
+   * be wrong about.
+   *
+   * Statuses are reached through the real guarded transitions rather than by a
+   * hand-written UPDATE, for the reason the rest of this suite gives: a row no
+   * repository could have produced is a fixture that proves nothing.
+   *
+   * @returns {Promise<{ roleId: string, byStatus: Record<string, string> }>}
+   */
+  async function seedEveryStatus() {
+    const { role } = await createRole();
+    const { candidates } = await createScreeningJob({
+      roleId: role.id,
+      candidates: [{}, {}, {}, {}, {}],
+    });
+
+    const [pending, parsing, evaluating, done, failed] = candidates;
+
+    await markCandidateParsing(pool, parsing.id);
+
+    await markCandidateParsing(pool, evaluating.id);
+    await markCandidateEvaluating(pool, { candidateId: evaluating.id, rawText: 'cv text' });
+
+    await driveCandidateToDone(done.id, { matchScore: 77.0, fitCategory: 'potential_match' });
+
+    await markCandidateParsing(pool, failed.id);
+    await markCandidateFailed(pool, {
+      candidateId: failed.id,
+      errorCode: 'EXTRACTION_FAILED',
+      errorMessage: 'no text layer',
+    });
+
+    return {
+      roleId: role.id,
+      byStatus: {
+        pending: pending.id,
+        parsing: parsing.id,
+        evaluating: evaluating.id,
+        done: done.id,
+        failed: failed.id,
+      },
+    };
+  }
+
+  /**
+   * @param {string} roleId
+   * @param {string[]} statusIn
+   * @param {object} [extra]
+   */
+  function list(roleId, statusIn, extra = {}) {
+    return listRankedCandidates(pool, { roleId, statusIn, limit: 25, offset: 0, ...extra });
+  }
+
+  it('returns the union of the statuses asked for, in one query', async () => {
+    const { roleId, byStatus } = await seedEveryStatus();
+
+    // The whole reason this parameter exists: "everything still working, plus
+    // everything that failed" is one filter, and the dashboard was issuing four
+    // parallel requests to express it.
+    const rows = await list(roleId, ['pending', 'parsing', 'evaluating', 'failed']);
+
+    expect(new Set(rows.map((row) => row.id))).toEqual(
+      new Set([byStatus.pending, byStatus.parsing, byStatus.evaluating, byStatus.failed]),
+    );
+  });
+
+  it('agrees with the single-status filter on a one-element set', async () => {
+    const { roleId, byStatus } = await seedEveryStatus();
+
+    const viaSet = await list(roleId, ['evaluating']);
+    const viaScalar = await listRankedCandidates(pool, {
+      roleId,
+      status: 'evaluating',
+      limit: 25,
+      offset: 0,
+    });
+
+    expect(viaSet.map((row) => row.id)).toEqual([byStatus.evaluating]);
+    expect(viaSet.map((row) => row.id)).toEqual(viaScalar.map((row) => row.id));
+  });
+
+  it('accepts the whole vocabulary and returns everything', async () => {
+    const { roleId } = await seedEveryStatus();
+
+    const rows = await list(roleId, ['pending', 'parsing', 'evaluating', 'done', 'failed']);
+
+    expect(rows).toHaveLength(5);
+  });
+
+  it('intersects with the single status param rather than overriding it', async () => {
+    const { roleId, byStatus } = await seedEveryStatus();
+
+    // Both filter one column and both are applied - `status` still means what it
+    // meant, and two filters compose with AND exactly as roleId and jobId do.
+    const overlapping = await list(roleId, ['done', 'failed'], { status: 'failed' });
+    const disjoint = await list(roleId, ['done'], { status: 'failed' });
+
+    expect(overlapping.map((row) => row.id)).toEqual([byStatus.failed]);
+    expect(disjoint).toEqual([]);
+  });
+
+  it('numbers LIMIT and OFFSET after the array parameter, whatever its length', async () => {
+    // The off-by-one this design exists to avoid. The set crosses as ONE bound
+    // array, so the next placeholder number is the same for a one-element filter
+    // and a five-element one. A hand-built `IN ($4,$5,$6)` is exactly where the
+    // placeholder count starts depending on the query string, and where a page
+    // silently becomes a LIMIT of the wrong value.
+    const { roleId } = await seedEveryStatus();
+
+    const sets = [
+      ['pending'],
+      ['pending', 'parsing'],
+      ['pending', 'parsing', 'evaluating'],
+      ['pending', 'parsing', 'evaluating', 'done'],
+      ['pending', 'parsing', 'evaluating', 'done', 'failed'],
+    ];
+
+    for (const statuses of sets) {
+      const label = statuses.join('+');
+      const all = await list(roleId, statuses);
+      const firstPage = await list(roleId, statuses, { limit: 1, offset: 0 });
+      const secondPage = await list(roleId, statuses, { limit: 1, offset: 1 });
+
+      expect(all, label).toHaveLength(statuses.length);
+      expect(firstPage.map((row) => row.id), label).toEqual([all[0].id]);
+      expect(secondPage.map((row) => row.id), label).toEqual(
+        all.length > 1 ? [all[1].id] : [],
+      );
+    }
+  });
+
+  it('keeps the count and the page filtered identically', async () => {
+    const { roleId } = await seedEveryStatus();
+    const statusIn = ['parsing', 'evaluating', 'failed'];
+
+    const rows = await list(roleId, statusIn);
+    const total = await countCandidates(pool, { roleId, statusIn });
+
+    expect(total).toBe(rows.length);
+    expect(total).toBe(3);
+  });
+
+  it('narrows the tier counts too, so the chips match the rows', async () => {
+    const { roleId } = await seedEveryStatus();
+
+    const scored = await countCandidatesByFitCategory(pool, { roleId, statusIn: ['done'] });
+    const working = await countCandidatesByFitCategory(pool, {
+      roleId,
+      statusIn: ['pending', 'parsing'],
+    });
+
+    expect(scored).toEqual({ strong_match: 0, potential_match: 1, unmatched: 0 });
+    // Nothing unscored belongs to a tier, so a working-set filter counts nobody.
+    expect(working).toEqual({ strong_match: 0, potential_match: 0, unmatched: 0 });
+  });
+
+  it('binds the set as a parameter, so a hostile value is data and not SQL', async () => {
+    // The boundary enum means this array can only ever hold one of five strings.
+    // This asserts the layer below it does not depend on that: the value reaches
+    // Postgres as an element of a bound text[], matches no row, and changes
+    // nothing. Interpolated, this test would drop the table instead of returning
+    // nothing.
+    const { roleId } = await seedEveryStatus();
+
+    const rows = await list(roleId, ["done') OR '1'='1", 'x; DROP TABLE candidates; --']);
+
+    expect(rows).toEqual([]);
+    expect(await countCandidates(pool, { roleId })).toBe(5);
+  });
+
+  it('ignores an absent statusIn entirely', async () => {
+    const { roleId } = await seedEveryStatus();
+
+    // `undefined` must not become `status = ANY(NULL)`, which matches nothing.
+    const rows = await listRankedCandidates(pool, {
+      roleId,
+      statusIn: undefined,
+      limit: 25,
+      offset: 0,
+    });
+
+    expect(rows).toHaveLength(5);
   });
 });

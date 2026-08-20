@@ -23,8 +23,18 @@ import { CANDIDATE_FULL_COLUMNS, toCandidate } from './candidateRow.js';
  * @typedef {TransitionApplied | TransitionNotFound | TransitionConflict} TransitionResult
  */
 
-/** Statuses a candidate can move out of. Terminal rows are not re-openable except via retry. */
-const NON_TERMINAL_STATUSES = ['pending', 'parsing', 'evaluating'];
+/**
+ * Statuses a candidate can move out of. Terminal rows are not re-openable except
+ * via retry.
+ *
+ * Exported for one reason: it is the other half of the partition `/config`
+ * publishes as `candidates.terminalStatuses`, and the two halves being a
+ * partition is a property worth checking rather than assuming. A status added to
+ * the column and to neither list, or to both, is caught by a test rather than by
+ * a poll that never stops. Nothing outside a test imports it - the repository
+ * layer stays the owner of its own guard.
+ */
+export const NON_TERMINAL_STATUSES = Object.freeze(['pending', 'parsing', 'evaluating']);
 
 /**
  * Runs a guarded UPDATE and turns "no rows matched" into a reason the caller can

@@ -29,7 +29,11 @@ import { SUPPORTED_MIME_TYPES } from '../extraction/index.js';
 import { env } from '../config/env.js';
 import { ok } from '../http/boundary.js';
 import { MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE } from '../schemas/common.schemas.js';
-import { CANDIDATE_STATUSES, MAX_STATUS_IDS } from '../schemas/candidate.schemas.js';
+import {
+  CANDIDATE_STATUSES,
+  MAX_STATUS_IDS,
+  TERMINAL_CANDIDATE_STATUSES,
+} from '../schemas/candidate.schemas.js';
 import { JOB_STATUSES } from '../services/jobStatus.js';
 import { pool } from '../db/pool.js';
 import { redisReachable } from '../queue/connection.js';
@@ -107,6 +111,17 @@ export async function getConfig(_request, reply) {
       },
       candidates: {
         statuses: CANDIDATE_STATUSES,
+        // The polling stop condition, published rather than left for a client to
+        // restate. `statuses` alone tells a dashboard what the column can hold
+        // and not when to stop asking, so every client had to carry its own
+        // `['done','failed']` - the last duplicated constant in the frontend,
+        // and a stop condition is the worst possible thing to keep two copies
+        // of: one copy drifting means a poll that never stops or one that stops
+        // on a candidate still being screened.
+        //
+        // Derived from the same map `statuses` comes from, so a sixth status
+        // cannot be added without answering whether it belongs here.
+        terminalStatuses: TERMINAL_CANDIDATE_STATUSES,
         maxStatusIds: MAX_STATUS_IDS,
       },
       jobs: {

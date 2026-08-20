@@ -1,6 +1,11 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { pool } from './helpers/database.js';
 import { ELIMINATION_RULE_TYPES } from '../src/repositories/roleEliminationRulesRepository.js';
+import {
+  CANDIDATE_STATUSES,
+  TERMINAL_CANDIDATE_STATUSES,
+} from '../src/schemas/candidate.schemas.js';
+import { NON_TERMINAL_STATUSES } from '../src/repositories/candidateStatusRepository.js';
 
 /**
  * Asserts the shape of the migrated schema.
@@ -346,5 +351,51 @@ describe('candidates integrity constraints', () => {
         'candidates_terminal_has_completed_at_check',
       ]),
     );
+  });
+});
+
+describe('the candidate status vocabulary is one vocabulary', () => {
+  /**
+   * The values `candidates_status_check` actually allows, read out of the live
+   * catalogue rather than out of the migration file.
+   *
+   * @returns {Promise<string[]>}
+   */
+  async function statusesFromColumnCheck() {
+    const { rows } = await pool.query(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conrelid = 'candidates'::regclass AND conname = 'candidates_status_check'`,
+    );
+    // Postgres rewrites `IN (...)` as `= ANY (ARRAY['a'::text, ...])`, so the
+    // quoted literals are pulled out rather than the list parsed.
+    return [...rows[0].def.matchAll(/'([a-z_]+)'::text/g)].map((match) => match[1]);
+  }
+
+  it('publishes exactly the statuses the column can hold', async () => {
+    expect([...CANDIDATE_STATUSES].sort()).toEqual((await statusesFromColumnCheck()).sort());
+  });
+
+  it('classifies every one of them as terminal or not', async () => {
+    // This is what makes `/config`'s `terminalStatuses` a derived fact rather
+    // than a second literal that happens to agree today. A sixth status added to
+    // the column - which is a migration, the only way one can be added - fails
+    // here unless it has been classified, and a status classified as both fails
+    // on the size check.
+    //
+    // The stop condition a dashboard polls against is the thing being protected:
+    // a terminal status missing from the list is a poll that never stops, and a
+    // non-terminal one wrongly in it is a poll that stops on a candidate still
+    // being screened.
+    const fromDatabase = await statusesFromColumnCheck();
+    const partition = [...TERMINAL_CANDIDATE_STATUSES, ...NON_TERMINAL_STATUSES];
+
+    expect([...partition].sort()).toEqual([...fromDatabase].sort());
+    expect(new Set(partition).size).toBe(fromDatabase.length);
+  });
+
+  it('names done and failed as the terminal pair, and no others', async () => {
+    // The current answer, pinned. The two tests above are the ones that survive a
+    // sixth status; this one is the one that reads as documentation.
+    expect(TERMINAL_CANDIDATE_STATUSES).toEqual(['done', 'failed']);
   });
 });

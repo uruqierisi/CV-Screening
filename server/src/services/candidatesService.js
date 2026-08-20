@@ -34,15 +34,27 @@ import { enqueueCandidate } from '../queue/screeningQueue.js';
  * @param {string} [options.jobId]
  * @param {string} [options.fitCategory]
  * @param {string} [options.status]
+ * @param {string[]} [options.statusIn]
  * @returns {Promise<{ candidates: any[], total: number, counts: Record<string, number> }>}
  */
 export async function listCandidatesPage({ limit, offset, sort, ...filters }) {
   const [candidates, total, counts] = await Promise.all([
     listRankedCandidates(pool, { limit, offset, direction: sort, ...filters }),
     countCandidates(pool, filters),
-    // Tier counts deliberately ignore a fitCategory filter: filtering to one tier
-    // and then counting tiers returns that tier and two zeroes.
-    countCandidatesByFitCategory(pool, { roleId: filters.roleId, jobId: filters.jobId, status: filters.status }),
+    // Every filter is passed through EXCEPT fitCategory: the tier counts are
+    // "across the whole filtered set", so a filter that narrowed the page but not
+    // the counts would put a header on the control that contradicts the rows
+    // under it. `statusIn` therefore goes through with the rest.
+    //
+    // fitCategory is the one exception, and deliberately: filtering to one tier
+    // and then counting tiers returns that tier and two zeroes, which is useless
+    // as the header of the filter control itself.
+    countCandidatesByFitCategory(pool, {
+      roleId: filters.roleId,
+      jobId: filters.jobId,
+      status: filters.status,
+      statusIn: filters.statusIn,
+    }),
   ]);
 
   return { candidates, total, counts };
