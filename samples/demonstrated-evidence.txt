@@ -1,0 +1,55 @@
+ROSE OKONKWO
+rose.okonkwo@example.com | +44 20 7946 0311 | London, UK
+
+PROFILE
+Backend engineer, ten years. I work in Node.js and PostgreSQL, mostly on
+services that other teams depend on and cannot afford to have go down.
+
+EXPERIENCE
+
+Staff Backend Engineer, Ardent Ledger -- March 2020 to present, London
+  Own the settlement service: Node.js, PostgreSQL 15, roughly 400 requests
+  per second at peak. Rewrote its event ingestion path around Node streams
+  after heap profiling showed we were buffering entire day-files in memory;
+  steady-state RSS fell from 3.1 GB to 240 MB and the nightly OOM restarts
+  stopped.
+  Designed the v2 settlement API that six internal teams now build against.
+  Wrote the idempotency layer behind it -- client-supplied keys stored with
+  the response, so a retried POST returns the original result instead of
+  double-paying a merchant. Versioned it under /v2 with a twelve-month
+  deprecation window for /v1, and wrote the migration guide the consuming
+  teams used.
+  Modelled the ledger schema and its partitioning. Added covering indexes
+  after reading pg_stat_statements rather than guessing, which took the
+  reconciliation query from 41s to 900ms. Every migration is forward-only
+  and ships behind an expand-contract sequence, because the database has
+  never been taken offline for a deploy.
+  Introduced contract tests between the settlement service and its two
+  consumers, and property-based tests over the money arithmetic. Test
+  coverage on the ledger module is 94%, and the failure paths -- partial
+  writes, duplicate keys, clock skew between nodes -- are the parts that
+  are actually tested.
+  Carry the pager for the service. Wrote the incident review after the
+  March 2023 settlement stall, which traced to a connection pool sized
+  against the old query profile; the write-up changed how the team sizes
+  pools and is still the document new joiners are pointed at.
+
+Senior Backend Engineer, Brightwell Health -- July 2016 to February 2020, Manchester
+  Built the appointment service in Node.js for 40 clinics, with PostgreSQL
+  behind it and a BullMQ worker fleet for the reminder pipeline.
+  Ran the migration from a single Postgres instance to primary/replica with
+  read routing, online, over three weeks and with no scheduled downtime.
+  Set up the deployment pipeline: Docker images, GitHub Actions running the
+  test suite and migrations as a deploy gate, and Terraform for the AWS
+  infrastructure underneath. Instrumented the service with OpenTelemetry
+  traces, which is what I used to find the N+1 in the clinician availability
+  endpoint during a live incident.
+  Mentored two junior engineers through their first on-call rotations and
+  wrote the RFC that got the team to adopt trunk-based development.
+
+EDUCATION
+BSc Computer Science, University of Bristol, 2012 - 2015, First Class Honours
+
+SKILLS
+Node.js, TypeScript, PostgreSQL, Redis, BullMQ, Docker, AWS, Terraform,
+GitHub Actions, OpenTelemetry

@@ -1,0 +1,64 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1258 >>
+stream
+BT /F1 18 Tf 1 0 0 1 72 720 Tm (Priya Ramanathan) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 700 Tm (priya.ramanathan@example.com | +44 20 7946 0102 | London, UK) Tj ET
+BT /F1 13 Tf 1 0 0 1 72 664 Tm (PROFILE) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 646 Tm (Backend engineer with nine years building payment and identity) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 632 Tm (systems in Node.js and PostgreSQL for regulated companies.) Tj ET
+BT /F1 13 Tf 1 0 0 1 72 596 Tm (EXPERIENCE) Tj ET
+BT /F1 11 Tf 1 0 0 1 72 578 Tm (Senior Backend Engineer, Northwind Payments) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 564 Tm (January 2019 - present, London) Tj ET
+BT /F1 10 Tf 1 0 0 1 86 546 Tm (Led the migration of the ledger service to PostgreSQL 14,) Tj ET
+BT /F1 10 Tf 1 0 0 1 86 532 Tm (cutting settlement reconciliation from six hours to eleven minutes.) Tj ET
+BT /F1 10 Tf 1 0 0 1 86 518 Tm (Designed the idempotency layer behind the public payments API.) Tj ET
+BT /F1 11 Tf 1 0 0 1 72 490 Tm (Backend Engineer, Griffin Health) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 476 Tm (March 2016 - December 2018, Manchester) Tj ET
+BT /F1 10 Tf 1 0 0 1 86 458 Tm (Built the appointment scheduling service used by 40 clinics.) Tj ET
+BT /F1 10 Tf 1 0 0 1 86 444 Tm (Introduced contract testing across six internal services.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 604 >>
+stream
+BT /F1 13 Tf 1 0 0 1 72 720 Tm (EDUCATION) Tj ET
+BT /F1 11 Tf 1 0 0 1 72 702 Tm (BSc Computer Science, University of Manchester) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 688 Tm (2012 - 2015, First Class Honours) Tj ET
+BT /F1 13 Tf 1 0 0 1 72 652 Tm (SKILLS) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 634 Tm (Node.js, TypeScript, PostgreSQL, Redis, Docker, AWS, Terraform) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 620 Tm (Distributed systems, API design, observability, incident response) Tj ET
+BT /F1 13 Tf 1 0 0 1 72 584 Tm (CERTIFICATIONS) Tj ET
+BT /F1 10 Tf 1 0 0 1 72 566 Tm (AWS Certified Solutions Architect - Associate, 2021) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000001557 00000 n 
+0000001683 00000 n 
+0000002338 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+2435
+%%EOF

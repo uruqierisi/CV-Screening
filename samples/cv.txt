@@ -1,0 +1,21 @@
+AISHA KHAN
+aisha.khan@example.com | +44 131 496 0900 | Edinburgh, UK
+
+PROFILE
+Backend engineer, six years, mostly Node.js and PostgreSQL. Comfortable
+owning a service end to end, from the schema to the dashboard nobody
+wanted to build.
+
+EXPERIENCE
+Senior Engineer, Kelpie Logistics -- February 2021 to present
+  Rewrote the route optimisation service; cut planning time by 70%.
+  Introduced database migrations to a team that had none.
+
+Engineer, Thistle Software -- August 2018 to January 2021
+  Maintained the billing service and its integration with Stripe.
+
+EDUCATION
+BSc Computing Science, University of Edinburgh, 2015 - 2018
+
+SKILLS
+Node.js, PostgreSQL, Redis, AWS, Docker, CI/CD
