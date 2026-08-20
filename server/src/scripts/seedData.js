@@ -87,8 +87,12 @@ const seniorBackendEngineer = {
       label: 'At least 5 years of professional software engineering experience',
       type: 'min_years_experience',
       value: { years: 5 },
-      // Default 'flag': a CV with unparseable or absent dates gets reviewed by a
-      // human rather than dropped. Decision 7-C - unknown facts do not eliminate.
+      // 'flag': a CV with unparseable or absent dates gets reviewed by a human
+      // rather than dropped. Decision 7-C - unknown facts do not eliminate. Stated
+      // rather than left to the column default, because `parseRole` requires it
+      // explicitly and a role assembled from this literal has no column to fall
+      // back on.
+      onMissing: 'flag',
       position: 0,
     },
     {
@@ -97,6 +101,9 @@ const seniorBackendEngineer = {
       value: { skill: 'PostgreSQL', matchMode: 'normalized', mustBeDemonstrated: true },
       // mustBeDemonstrated: listing "PostgreSQL" in a skills block is a claim, not
       // a demonstration; this rule only passes on evidence of the skill being used.
+      // 'flag' because an extraction that found no skills at all must not reject
+      // the candidate on this rule's account.
+      onMissing: 'flag',
       position: 1,
     },
     {
@@ -184,20 +191,26 @@ const icuNurse = {
       label: 'Advanced Cardiovascular Life Support (ACLS) certification',
       type: 'required_certification',
       value: { name: 'Advanced Cardiovascular Life Support', matchMode: 'normalized' },
-      // Default 'flag': ACLS is routinely obtainable after hire and is frequently
-      // omitted from a CV that lists a dozen other certificates.
+      // 'flag': ACLS is routinely obtainable after hire and is frequently omitted
+      // from a CV that lists a dozen other certificates.
+      onMissing: 'flag',
       position: 1,
     },
     {
       label: 'Associate degree in nursing or higher',
       type: 'required_education_level',
       value: { level: 'associate' },
+      // 'flag': an education section this extraction could not read is a parsing
+      // failure far more often than it is a candidate without a degree.
+      onMissing: 'flag',
       position: 2,
     },
     {
       label: 'At least 2 years of post-qualification nursing experience',
       type: 'min_years_experience',
       value: { years: 2 },
+      // 'flag', for the same reason as the backend role's years rule.
+      onMissing: 'flag',
       position: 3,
     },
   ],
