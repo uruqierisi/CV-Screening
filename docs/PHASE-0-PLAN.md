@@ -200,9 +200,34 @@ point of showing the work.
 | `(role_id, match_score DESC NULLS LAST, id DESC)` | dashboard default ranking |
 | `(role_id, fit_category, match_score DESC NULLS LAST, id DESC)` | ranking with a tier filter (no index skip-scan in PG) |
 | `(job_id, status)` | `GET /jobs/:id` aggregate — the hot polling query |
-| `(role_id, content_sha256)` | duplicate-CV lookup; **non-unique on purpose** |
+| `(role_id, content_sha256)` | upload idempotency; **UNIQUE** (migration 0008) - see below |
 | `(status) WHERE status IN ('pending','parsing','evaluating')` | stuck-candidate sweep |
 | `screening_jobs(role_id)` | the `ON DELETE RESTRICT` check PG runs on every role delete |
+
+**`(role_id, content_sha256)` became UNIQUE in phase 4, reversing this section.** It was
+originally non-unique on purpose, so that duplicates were detectable after the fact rather than
+prevented. The project owner changed that decision: **uploads are idempotent on
+`(role_id, content_sha256)`**, enforced by `candidates_role_content_sha256_key` (migration 0008,
+forward-only, with a working `down` that restores the non-unique index exactly).
+
+Idempotency is now the index rather than the `Idempotency-Key` header §3 declined - the cheaper
+and stronger of the two, because a header is a promise a client has to keep and a constraint is
+a promise the database keeps.
+
+**A duplicate upload returns the existing candidate**, and does not error. Same bytes, same role,
+same result: no new work, no second LLM spend, and no 409 to make a double-clicked button look
+broken. Re-screening a candidate that *failed* remains the retry endpoint's job - that is a
+different question from "have I already uploaded this CV", and conflating them would put a
+recruiter who re-uploaded instead of pressing Retry into a loop. The upload response shape is
+unchanged; the response says which files were new (§3).
+
+The constraint is **per role**, unchanged: the same person applying for two jobs is two
+screenings against two rubrics.
+
+*Recorded cost:* on a populated database this migration fails if any duplicate pair already
+exists. It was checked against the development and test databases before it was written - zero
+candidate rows, therefore zero duplicate pairs - and the correct response to that failure on a
+real database is to look at the rows, not to delete anybody's candidates.
 
 **`role_criteria(role_id)` and `role_elimination_rules(role_id)` are deliberately absent.**
 Each is a strict prefix of a unique constraint already on its own table — `(role_id, label)`
@@ -273,25 +298,54 @@ are the ones that spend real API money. With no auth the only principal is the c
 which bounds how much this actually buys; it is a cost guard, not a security control.
 
 **Retry** clears `error_code` / `error_message` / `completed_at`, sets `status` back to
-`pending`, bumps `attempts`, and re-enqueues under a fresh queue-job id (`candidateId:attempts`,
-since the original id is consumed). `409 CANDIDATE_NOT_RETRYABLE` if the status is not `failed`;
-`410 SOURCE_FILE_MISSING` if the stored file is gone from disk.
+`pending`, bumps `attempts`, and re-enqueues under a fresh queue-job id, since the original id is
+consumed. `409 CANDIDATE_NOT_RETRYABLE` if the status is not `failed`; `410 SOURCE_FILE_MISSING`
+if the stored file is gone from disk - and that check runs **before** the status is reset,
+because resetting first would leave a candidate `pending` that no worker can ever complete.
 
-**Not built:** `Idempotency-Key` on upload. A double-clicked upload button therefore creates
-duplicate candidates and spends the LLM budget twice. The `(role_id, content_sha256)` index
-makes duplicates detectable after the fact, and the README will name this as a known
-limitation rather than pretend it is handled.
+The fresh id is **`candidateId-retry-N`**, not the `candidateId:attempts` this section originally
+specified. BullMQ rejects a custom job id containing a colon outright (`Custom Id cannot contain
+:`) because it builds its own Redis keys with that separator; the colon form was found to be
+unusable by the queue's own integration test, and the plan is corrected rather than left
+describing an id the queue refuses. Shape and reasoning are unchanged: one deterministic id per
+manual retry, so a double-clicked Retry cannot produce two screenings either.
+
+**Upload idempotency is the index, not a header.** `Idempotency-Key` is still not built and is
+now not needed: the UNIQUE `(role_id, content_sha256)` added in migration 0008 (§2) means a
+double-clicked upload button returns the candidate that already exists rather than creating a
+second one and spending the LLM budget twice. A header would have asked the client to generate
+and keep a key; the constraint asks nothing of anybody and cannot be forgotten.
+
+The reversal is recorded in §2 and §8 as well as here, because all three sections previously
+said the opposite.
 
 `GET /api/v1/config` exists so upload limits, rule-type descriptors and tier thresholds are
 defined **once, server-side**, instead of being duplicated as client constants that drift.
 
-**Upload** (`202`): `{ jobId, roleId, candidates: [{ id, originalFilename, status: "pending" }] }`.
+**Upload** (`202`): `{ jobId, roleId, candidates: [{ id, originalFilename, status, duplicate }] }`,
+with `meta: { fileCount, created, duplicates }`.
 A single upload still creates a screening job of size 1, so the dashboard has exactly one
 polling shape. Batch is all-or-nothing at the HTTP layer (`details.rejected` names the bad
 files); once accepted, failure is strictly per-candidate.
 
+`duplicate` is what makes idempotency observable: one entry per uploaded file, in upload order,
+so a caller can line the response up with what it sent and see which files were new. `status` is
+the candidate's **real** status rather than a hard-coded `"pending"` - for a new candidate those
+are the same string, and for a duplicate of something already screened it is `done`, which is
+what stops the dashboard polling for work that finished last week.
+
 **Job status** is derived: all pending → `queued`; any non-terminal → `in_progress`;
 all terminal with ≥1 failed → `completed_with_failures`; else `completed`.
+
+**A job with no candidates at all reads `completed`**, and that case is phase 4's rather than an
+oversight in the rule above. Upload idempotency means a batch whose files were all uploaded
+before produces a screening job with a `fileCount` and zero candidates of its own - the
+duplicates keep the `job_id` of the upload that first created them, because re-pointing them
+would corrupt the older job's aggregate. Zero satisfies both "all pending" and "all terminal"
+vacuously, so the rule is ambiguous there; `completed` is the branch that does not send a
+dashboard into a poll for work that will never arrive. `GET /jobs/:jobId` therefore also returns
+`duplicateCount = fileCount - counts.total`, so a 5-file upload showing 3 candidates is explained
+rather than looking like data loss.
 
 **Candidate list row:** `{ id, roleId, jobId, candidateName, originalFilename, status,
 matchScore, fitCategory, eliminated, eliminatedBy, errorCode, createdAt, completedAt }`,
@@ -312,12 +366,19 @@ evaluationMatrix: {
 }
 ```
 
-**Open contract gap, recorded so Phase 4 does not rediscover it.** `ai_justification` is stored
-(§2) and its source is defined (§5.1 — the model's `summary`, prose only), but no response shape
-in this section carries it: it is absent from the candidate list row and from the detail fields
-above. The detail response is where it belongs — it is per-candidate prose a recruiter reads
-once, not something to ship in a 25-row page. Phase 4 must add it as `aiJustification` to the
-candidate detail payload, or decide deliberately that the field is written and never read.
+**Contract gap closed in phase 4: `aiJustification` is part of the candidate detail payload.**
+It was left open twice - the column is stored (§2), its source is defined (§5.1, the model's
+`summary`, prose only), and no response shape carried it. It is now returned by
+`GET /api/v1/candidates/:candidateId` and by nothing else.
+
+Detail and not the list, for the reason this section already gave: it is two or three sentences
+of per-candidate prose a recruiter reads once, when they have opened one person, and shipping it
+in a ranked page multiplies it by the page size to render a table that has nowhere to put it -
+the same argument that keeps `parsed_profile` and `evaluation_matrix` out of the list projection.
+The alternative, "written and never read", was rejected because the summary is the only place the
+model's own synthesis survives: every other piece of model output on the detail screen is
+per-criterion, and paying for a sentence on every candidate and then discarding it is the worst of
+both. The list projection is unchanged, so this costs nothing on the hot path.
 
 `weightedPoints = rating × weight`, and `Σ weightedPoints === scoreRaw`. This is what lets the
 detail screen show a **Contribution** column that reconciles exactly to the final score —
@@ -1163,7 +1224,8 @@ Institution names are **not** redacted. That would remove signal recruiters legi
 and should be a role-level toggle rather than a unilateral default.
 
 **E. Also in:** `POST /candidates/:id/retry`, and rate limiting on the two upload endpoints.
-**Not in:** `Idempotency-Key` on upload — see §3.
+**Not in:** `Idempotency-Key` on upload - and since phase 4 it is not needed either, because
+upload idempotency is enforced by a UNIQUE `(role_id, content_sha256)` instead. See §2 and §3.
 
 **F. Scanned PDFs — detect and fail clearly; no OCR.** A PDF whose text layer yields too little
 extractable text for its page count is not sent to the model. The candidate fails with
@@ -1255,9 +1317,15 @@ README is in §4.
   be stated explicitly.
 - **CVs are personal data with no delete endpoint, no TTL and no retention policy.** The spec
   omits it; a real deployment cannot.
-- **Uploads are not idempotent.** A double-clicked upload button creates duplicate candidates
-  and spends the LLM budget twice. Duplicates are detectable after the fact via
-  `(role_id, content_sha256)` but are not prevented.
+- ~~**Uploads are not idempotent.**~~ **Reversed in phase 4**, and the entry is struck through
+  rather than deleted because the reversal is the part worth reading. Uploads are idempotent on
+  `(role_id, content_sha256)`, enforced by a UNIQUE constraint (migration 0008); a duplicate
+  upload returns the existing candidate rather than creating a second one or erroring.
+
+  What remains true, and is the residual limitation: **idempotency is on the bytes, not on the
+  person.** The same CV re-exported from Word - one byte different - is a new candidate and a
+  second bill. Nothing here deduplicates by name or email, deliberately: two people can share a
+  name, and one person can have two CVs worth screening separately.
 - **Ranking worst-first is a backwards scan of a `DESC NULLS LAST` index**, not an index-backed
   ascending order, and is fine at these row counts.
 - **An empty fact list is treated as unknown, not as absence.** A rule whose profile fact is
