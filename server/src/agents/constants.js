@@ -156,6 +156,16 @@ export const EVIDENCE_TYPES = Object.freeze(['demonstrated', 'listed_only']);
  * overflow needs its own code: it is neither bad model output nor an empty
  * document, and folding it into either would point the reader at the wrong
  * cause.
+ *
+ * `AGENT_SCHEMA_REJECTED` is the second addition, and it exists for the same
+ * reason turned inside out. The API rejected the *output schema this repository
+ * sent*, before the model ever saw the request. That is a permanent
+ * configuration fault in our own code - retrying it never fixes it - and
+ * reporting it as `AGENT_UPSTREAM` sends an operator to look at the network, the
+ * rate limit or Anthropic's status page when the thing to fix is a schema in
+ * `src/agents/schemas/`. See `client/errors.js` for what raises it and
+ * `test/agents/schema-budget.test.js` for the test that is meant to catch
+ * it before a request is ever made.
  */
 export const AGENT_ERROR_CODES = Object.freeze({
   BAD_OUTPUT: 'AGENT_BAD_OUTPUT',
@@ -164,6 +174,7 @@ export const AGENT_ERROR_CODES = Object.freeze({
   UNKNOWN_RULE: 'AGENT_UNKNOWN_RULE',
   EMPTY_DOCUMENT: 'EMPTY_DOCUMENT',
   INPUT_TOO_LARGE: 'AGENT_INPUT_TOO_LARGE',
+  SCHEMA_REJECTED: 'AGENT_SCHEMA_REJECTED',
   TIMEOUT: 'AGENT_TIMEOUT',
   RATE_LIMIT: 'AGENT_RATE_LIMIT',
   UPSTREAM: 'AGENT_UPSTREAM',

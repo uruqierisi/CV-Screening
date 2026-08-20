@@ -5,9 +5,14 @@ import {
   retryNotice,
   summaryMustNotStateAScore,
 } from '../../src/agents/prompts/shared-rules.js';
-import { extractionPrompt } from '../../src/agents/prompts/extraction.prompt.js';
+import {
+  EXTRACTION_PROMPT_VERSION,
+  extractionPrompt,
+} from '../../src/agents/prompts/extraction.prompt.js';
 import { evaluationPrompt } from '../../src/agents/prompts/evaluation.prompt.js';
 import { findScoreFigure } from '../../src/agents/scoring/validate-summary.js';
+import { EDUCATION_LEVELS, EVIDENCE_TYPES } from '../../src/agents/constants.js';
+import { extractedProfileSchema } from '../../src/agents/schemas/profile.schema.js';
 import { GOLDEN_CV_TEXT, GOLDEN_PROFILE, GOLDEN_ROLE } from './fixtures/golden.js';
 
 /**
@@ -112,10 +117,49 @@ describe('the extraction prompt', () => {
     }
   });
 
-  it('says null is a correct answer, not a failure', () => {
-    // The single load-bearing line of the anti-fabrication story.
-    expect(system).toMatch(/`null` is a correct answer, not a failure/);
-    expect(system).toMatch(/never substitute a placeholder/i);
+  it('says leaving a field out is a correct answer, not a failure', () => {
+    // The single load-bearing line of the anti-fabrication story. It used to say
+    // `null`; the schema now marks an absent fact by omitting the key, because a
+    // nullable field compiles to a union and the API caps a schema at sixteen of
+    // them. The instruction has to follow the schema, or the model is being told
+    // one thing and validated against another.
+    expect(system).toMatch(/Omitting a field is a correct answer, not a failure/);
+    expect(system).toMatch(/never substitute a\s*\n?placeholder/i);
+    // And no leftover instruction to send the thing the schema now rejects.
+    expect(system).not.toMatch(/`null`/);
+  });
+
+  it('names the flat location fields the schema actually defines', () => {
+    // Flattening `location` was a wire decision, and the prompt is the only
+    // place the model learns about it. `locationRaw` was deleted from the schema
+    // and had to leave the prompt with it, or the model would be filling in a
+    // field that no longer exists and every extraction would fail on a strict
+    // object.
+    for (const field of ['locationCity', 'locationRegion', 'locationCountryCode']) {
+      expect(system).toContain(field);
+    }
+    expect(system).not.toContain('locationRaw');
+    expect(system).toMatch(/ISO-3166-1 alpha-2/);
+  });
+
+  it('tells the model that an empty list is how a missing section is reported', () => {
+    // The four lists are required on the wire now, so omission is no longer
+    // available and the prompt has to say what replaced it. Without this the
+    // model would either omit a list - a validation failure and a wasted retry -
+    // or invent an entry to fill one, which is the failure this system exists to
+    // prevent.
+    expect(system).toMatch(/`workHistory`, `education`, `certifications` and `skills` are always/);
+    expect(system).toMatch(/When the CV has no such section, send an empty list/);
+    expect(system).toMatch(/Never invent an entry to avoid one/);
+  });
+
+  it('tells the model that leaving out an end date means the role is current', () => {
+    // `isCurrent` was deleted, so absence of `endDate` is the only encoding
+    // left. `compute-experience.js` reads it that way, and an instruction that
+    // did not say so would leave the model guessing which absence it was
+    // spelling - and a wrong guess adds years to somebody's experience.
+    expect(system).toMatch(/Leave `endDate` out of a work-history entry when the candidate is still/);
+    expect(system).toMatch(/do not leave `endDate` out of a role that\s*\n?has finished/);
   });
 
   it('names the honest option first and makes the dishonest one more work', () => {
@@ -140,9 +184,128 @@ describe('the extraction prompt', () => {
     expect(system).toMatch(/Do not add up the roles yourself/i);
   });
 
-  it('carries the shared rules rather than its own copy of them', () => {
-    expect(system).toContain(outputContractRule());
+  it('carries the shared anti-fabrication rule rather than its own copy of it', () => {
     expect(system).toContain(noFabricationRule());
+  });
+
+  it('does not tell the model a schema is attached, because none is', () => {
+    // `outputContractRule()` says the answer is checked against "the provided
+    // schema". That was true while extraction sent `output_config.format` and is
+    // false now, and an instruction the model can see is false invites the rest
+    // of the prompt to be read as approximate. Evaluation still uses it.
+    expect(system).not.toContain(outputContractRule());
+    expect(system).not.toMatch(/provided schema/i);
+  });
+});
+
+/**
+ * The two things the decoding grammar used to do, now done by prompt text.
+ *
+ * Extraction sends no `output_config.format` (plan section 5.2), so nothing but
+ * these instructions stands between the model and a response that is JSON
+ * wrapped in an apology. They are tested harder than the rest of the prompt
+ * because breaking one is not a wording regression - it is a decoder regression.
+ */
+describe('the extraction prompt, now that it carries what the schema used to', () => {
+  const { system, user } = extractionPrompt({ cvText: GOLDEN_CV_TEXT });
+
+  it('demands JSON and nothing else, in the three ways a model gets this wrong', () => {
+    // A preamble, a trailing remark, and a code fence. `json-response.js` strips
+    // a leading fence defensively, but a strip is a backstop for a fraction of a
+    // percent; this instruction is the actual control.
+    expect(system).toMatch(/WHOLE RESPONSE IS ONE JSON OBJECT/);
+    expect(system).toMatch(/No preamble, no explanation, no/);
+    expect(system).toMatch(/commentary after it, and no markdown code fence/);
+    expect(system).toMatch(/first\s*\n?character you write is the opening brace/);
+    // And once more where the model is actually asked to answer.
+    expect(user).toMatch(/Answer with the JSON object alone/);
+  });
+
+  it('forbids keys the schema does not define, which strict parsing enforces', () => {
+    // `extractedProfileSchema` is `.strict()`, so an invented key fails the whole
+    // document. Without a grammar the model can now emit one, so it has to be
+    // told - and told what it costs.
+    expect(system).toMatch(/Use exactly the keys shown below/);
+    expect(system).toMatch(/validated strictly and one unknown\s*\n?key fails the whole document/);
+  });
+
+  /**
+   * The drift guard for a hand-written shape block.
+   *
+   * Writing the shape out in prose is the right call - a pasted JSON Schema
+   * spends hundreds of tokens teaching the model to read
+   * `additionalProperties: false` instead of showing it the answer - but it
+   * creates the one surface a generated block would not have: a field can be
+   * added to the schema and forgotten in the prompt, and the model would then
+   * never emit it. So the two are compared here, in both directions.
+   *
+   * The JSON skeleton is the only place in this prompt that writes `"key":`, so
+   * scanning the whole system text for that pattern collects exactly the block's
+   * keys and nothing else.
+   */
+  describe('the shape block and the schema describe the same fields', () => {
+    /** @param {any} schema @returns {any} the inner type of any wrapper */
+    const unwrap = (schema) => {
+      let current = schema;
+      // ZodEffects (`z.preprocess`), ZodOptional and ZodArray all hide the thing
+      // this walk is actually after.
+      while (current?._def?.schema ?? current?._def?.innerType ?? current?._def?.type) {
+        current = current._def.schema ?? current._def.innerType ?? current._def.type;
+      }
+      return current;
+    };
+
+    /** @param {any} objectSchema @returns {string[]} */
+    const fieldNames = (objectSchema) => {
+      const shape = objectSchema._def.shape();
+      return Object.entries(shape).flatMap(([name, value]) => {
+        const inner = unwrap(value);
+        const nested = inner?._def?.shape === undefined ? [] : fieldNames(inner);
+        return [name, ...nested];
+      });
+    };
+
+    const schemaFields = [...new Set(fieldNames(extractedProfileSchema))].sort();
+    const promptFields = [...new Set([...system.matchAll(/"([A-Za-z]+)":/g)].map((m) => m[1]))]
+      .sort();
+
+    it('finds a shape block to compare, rather than passing on an empty set', () => {
+      expect(promptFields.length).toBeGreaterThan(15);
+      expect(schemaFields.length).toBe(promptFields.length);
+    });
+
+    it('names every field the schema defines, and no field it does not', () => {
+      expect(promptFields).toEqual(schemaFields);
+    });
+
+    it('spells the two closed sets from the constants rather than by hand', () => {
+      // A hand-typed copy of a closed set is a copy that goes stale, and a
+      // `level` the enum does not accept fails the whole document.
+      for (const level of EDUCATION_LEVELS) {
+        expect(system).toContain(`"${level}"`);
+      }
+      for (const type of EVIDENCE_TYPES) {
+        expect(system).toContain(`"${type}"`);
+      }
+    });
+
+    it('says which keys are always present, since `required` is no longer sent', () => {
+      expect(system).toMatch(/The four lists .* are/);
+      expect(system).toMatch(/`name` on a certification, and `name` and/);
+      expect(system).toMatch(/Every other key is optional/);
+      // And that a list holds as many entries as the CV describes - a skeleton
+      // showing one entry is otherwise readable as a limit of one.
+      expect(system).toMatch(/not a limit of one/);
+    });
+  });
+
+  it('is version 2.1.0: same document, different way of asking for it', () => {
+    // Asserted rather than pattern-matched, because the version is stored beside
+    // every extraction and is what makes two profiles comparable. A minor bump
+    // says the field set and the absence convention are unchanged - only the
+    // instructions that replace the grammar are new. Changing this number should
+    // take a deliberate edit with a reviewer attached.
+    expect(EXTRACTION_PROMPT_VERSION).toBe('2.1.0');
   });
 });
 

@@ -66,8 +66,10 @@ export const CANDIDATE_DEADLINE_MS = 240_000;
 
 /**
  * @param {object} params
- * @param {{ messages: { parse: Function } }} params.client injected; the only
- *   thing in this call graph that knows an SDK exists
+ * @param {{ messages: { create: Function, parse: Function } }} params.client
+ *   injected; the only thing in this call graph that knows an SDK exists. Both
+ *   methods, because extraction sends no schema and evaluation does
+ *   (`client/call-structured.js`)
  * @param {unknown} params.role straight from the repository
  * @param {string} params.cvText raw text, from phase 3's document parsing
  * @param {Date} params.now injected clock: experience, certification expiry and

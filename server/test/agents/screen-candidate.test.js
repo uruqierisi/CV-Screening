@@ -16,8 +16,8 @@ import {
   GOLDEN_EVALUATION,
   GOLDEN_EXPECTED,
   GOLDEN_NOW_ISO,
-  GOLDEN_PROFILE,
   GOLDEN_ROLE,
+  extractedProfile,
 } from './fixtures/golden.js';
 
 /**
@@ -32,19 +32,8 @@ import {
 
 const NOW = new Date(GOLDEN_NOW_ISO);
 
-/** What the model returns from extraction: no derived fields. */
-function modelProfile(overrides = {}) {
-  const { computedYearsExperience, skills, ...rest } = GOLDEN_PROFILE;
-  return {
-    ...rest,
-    skills: skills.map(({ name, evidenceType, evidenceQuote }) => ({
-      name,
-      evidenceType,
-      evidenceQuote,
-    })),
-    ...overrides,
-  };
-}
+/** What the model returns from extraction: flat, sparse, no derived fields. */
+const modelProfile = extractedProfile;
 
 const HAPPY_PATH = [{ json: modelProfile() }, { json: GOLDEN_EVALUATION }];
 
@@ -282,8 +271,8 @@ describe('nothing candidate-identifying reaches a log line', () => {
     {
       what: 'a schema mismatch on a field holding CV text',
       script: [
-        { json: modelProfile({ headline: { nested: SENTINEL } }) },
-        { json: modelProfile({ headline: { nested: SENTINEL } }) },
+        { json: modelProfile({ fullName: { nested: SENTINEL } }) },
+        { json: modelProfile({ fullName: { nested: SENTINEL } }) },
       ],
     },
     {

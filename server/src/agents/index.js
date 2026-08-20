@@ -52,8 +52,10 @@ export {
 } from './errors.js';
 
 export {
+  EXTRACTED_LOCATION_FIELDS,
   certificationSchema,
   educationSchema,
+  extractedProfileSchema,
   locationSchema,
   profileSchema,
   skillSchema,
@@ -85,6 +87,10 @@ export { scoreCandidate } from './scoring/score-candidate.js';
 
 export {
   computeExperience,
+  // Exported beside `computeExperience` because the two answer one question
+  // between them: what the dates support, and - when they support nothing - why
+  // not, in words a recruiter can act on.
+  explainMissingExperience,
   monthsToYears,
   parseCvDate,
   withComputedExperience,
@@ -116,7 +122,14 @@ export {
   toOutputFormat,
 } from './client/anthropic-client.js';
 
-export { SEMANTIC_RETRIES, callStructured } from './client/call-structured.js';
+export { RESPONSE_FORMATS, SEMANTIC_RETRIES, callStructured } from './client/call-structured.js';
+
+export {
+  messageText,
+  parseJsonResponse,
+  parseMessageJson,
+  stripCodeFences,
+} from './client/json-response.js';
 
 export {
   AgentBadOutputError,
@@ -124,6 +137,7 @@ export {
   AgentInputTooLargeError,
   AgentRateLimitError,
   AgentRefusalError,
+  AgentSchemaRejectedError,
   AgentTimeoutError,
   AgentUpstreamError,
   AnthropicConfigurationError,
@@ -142,6 +156,7 @@ export { normalizeProfile } from './extraction/normalize-profile.js';
 export {
   EXTRACTION_EFFORT,
   EXTRACTION_MAX_TOKENS,
+  EXTRACTION_RESPONSE_FORMAT,
   EXTRACTION_TIMEOUT_MS,
   extractProfile,
 } from './extraction/extract-profile.js';

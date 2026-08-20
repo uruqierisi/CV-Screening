@@ -6,8 +6,10 @@
  *
  * 1. **Guard the input.** Text that is not worth a token never becomes a call.
  * 2. **Extract**, seeing the CV and nothing else (no role, no criteria).
- * 3. **Normalize.** Field-level repair: bad email nulled, duplicate skills
- *    merged, implausible figures dropped. Nothing invented.
+ * 3. **Normalize.** Fill and repair, in that order: every field the model left
+ *    out becomes `null` and the flat `location*` fields become the nested
+ *    `location` the rest of the system reads, then bad email nulled, duplicate
+ *    skills merged, implausible figures dropped. Nothing invented.
  * 4. **Verify.** Every `demonstrated` claim is checked against the source text
  *    and downgraded if its quote is not there. This is the only claim in the
  *    system a machine can falsify, and it runs on every candidate.
@@ -23,9 +25,9 @@
  * this one call, and evaluation cannot see past it.
  */
 
-import { profileSchema } from '../schemas/profile.schema.js';
+import { extractedProfileSchema } from '../schemas/profile.schema.js';
 import { extractionPrompt, EXTRACTION_PROMPT_VERSION } from '../prompts/extraction.prompt.js';
-import { callStructured } from '../client/call-structured.js';
+import { RESPONSE_FORMATS, callStructured } from '../client/call-structured.js';
 import { AgentInputError } from '../client/errors.js';
 import { NOOP_LOGGER } from '../util/logger.js';
 import { assessCvText } from '../util/text.js';
@@ -35,6 +37,31 @@ import { withComputedExperience } from './compute-experience.js';
 
 /** Named so the reader sees what this call is, not just what it costs. */
 export const EXTRACTION_STAGE = 'extraction';
+
+/**
+ * **Extraction asks for JSON in the response body and sends no schema.**
+ *
+ * This is the one deliberate exception to the layer's default, and it was a
+ * measurement rather than a preference. The API compiles an output schema into a
+ * decoding grammar, and that compilation - not the documented union and optional
+ * caps, both of which this schema is comfortably under - is what stopped the
+ * request. A bisect against the live API is recorded in plan section 5.2: eight
+ * optional scalars plus one three-property array answered in 3.4 seconds; the
+ * same request with one eight-property array, or with a second array, timed out
+ * past sixty seconds in the same run.
+ *
+ * What is given up, stated plainly: the API no longer guarantees the response is
+ * shaped like the schema. What is *not* given up is the guarantee that mattered,
+ * because it was never the grammar's - `extractedProfileSchema` still validates
+ * every response, a mismatch still burns the one semantic retry with the failing
+ * paths fed back, and a second bad response still fails the candidate. The prompt
+ * carries the shape the grammar used to carry (section 5.2).
+ *
+ * Evaluation keeps its grammar. That call has two unions, no arrays of objects,
+ * compiles in practice, and is the one task in the system where a grammar is
+ * constraining *reasoning* rather than transcription.
+ */
+export const EXTRACTION_RESPONSE_FORMAT = RESPONSE_FORMATS.TEXT;
 
 /**
  * Effort `low`, from plan section 5.2. This is transcription: thinking on it is
@@ -68,7 +95,8 @@ export const EXTRACTION_MAX_TOKENS = 6_000;
 
 /**
  * @param {object} params
- * @param {{ messages: { parse: Function } }} params.client injected
+ * @param {{ messages: { create: Function } }} params.client injected. Extraction
+ *   sends no schema, so this call goes through `messages.create`.
  * @param {string} params.cvText raw text of one CV
  * @param {Date} params.now injected clock, for the experience computation
  * @param {AbortSignal} [params.signal] the candidate-wide deadline
@@ -98,9 +126,13 @@ export async function extractProfile({
 
   const { data, attempts, usage } = await callStructured({
     client,
-    schema: profileSchema,
+    schema: extractedProfileSchema,
     prompt: extractionPrompt({ cvText }),
     stage: EXTRACTION_STAGE,
+    // No `output_config.format` on this request. The same schema above still
+    // validates the response - see EXTRACTION_RESPONSE_FORMAT for what that
+    // does and does not buy.
+    responseFormat: EXTRACTION_RESPONSE_FORMAT,
     effort: EXTRACTION_EFFORT,
     maxTokens: EXTRACTION_MAX_TOKENS,
     timeoutMs: EXTRACTION_TIMEOUT_MS,

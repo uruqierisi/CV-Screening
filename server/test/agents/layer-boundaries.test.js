@@ -196,6 +196,7 @@ describe('the public surface', () => {
       'assignTier',
       'parseRole',
       'makeEvaluationSchema',
+      'extractedProfileSchema',
       'profileSchema',
       'verifiedProfileSchema',
       'computeExperience',
@@ -214,6 +215,15 @@ describe('the public surface', () => {
       'normalizeProfile',
       'callStructured',
       'createAnthropicClient',
+      // The two ways of asking for JSON, and the parser that reads the answer
+      // when no schema was sent. Public for the same reason `EXTRACTION_EFFORT`
+      // is: it is a decision about a call, and a caller reasoning about cost or
+      // reliability needs to be able to read it.
+      'RESPONSE_FORMATS',
+      'EXTRACTION_RESPONSE_FORMAT',
+      'parseMessageJson',
+      'stripCodeFences',
+      'AgentSchemaRejectedError',
       'extractionPrompt',
       'evaluationPrompt',
       'assessCvText',

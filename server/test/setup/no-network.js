@@ -41,7 +41,7 @@ export class NetworkAccessInTestError extends Error {
         '',
         'No test in the `unit` project may reach the network. The agent layer takes',
         'its client by injection precisely so that it does not have to: pass a fake',
-        '`{ messages: { parse } }` object instead of constructing a real one.',
+        '`{ messages: { parse, create } }` object instead of constructing a real one.',
         '',
         'If you are seeing this from library code, something now constructs an',
         'Anthropic client where it used to be handed one.',

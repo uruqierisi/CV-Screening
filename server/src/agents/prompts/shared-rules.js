@@ -8,25 +8,43 @@
  *
  * The fragments are separate functions rather than one blob because the two
  * prompts genuinely need different subsets: extraction is a transcription task
- * that must be told `null` is an answer, and evaluation is a judging task that
- * must be told it is not allowed to produce the number.
+ * that must be told absence is an answer, and evaluation is a judging task that
+ * must be told it is not allowed to produce the number. Since the two calls stopped
+ * asking for their JSON the same way, `outputContractRule()` is one of those
+ * subsets too - see its own note.
  */
 
 /**
- * How the model is expected to answer, for both calls.
+ * How the model is expected to answer **on a call that sends a schema**, which
+ * since prompt version 2.1.0 means the evaluation call and only that one.
  *
- * The schema is enforced by the API, so this is not what makes the output valid -
- * it is what stops the model wrapping valid JSON in an explanation, which is the
- * most common way a structured-output call gets thrown away.
+ * The schema is enforced by the API there, so this is not what makes the output
+ * valid - it is what stops the model wrapping valid JSON in an explanation,
+ * which is the most common way a structured-output call gets thrown away.
+ *
+ * Extraction stopped using it when it stopped sending a schema, and has its own
+ * contract in `extraction.prompt.js` instead. The sentence "matching the provided
+ * schema" would be false on that call, and an instruction the model can see is
+ * false costs more than the one it replaced: it invites the rest of the prompt to
+ * be read as approximate. The fragment stayed here rather than moving into the
+ * evaluation prompt because it is about the *shape of an answer* rather than
+ * about judging a candidate, and the next call this system grows will send a
+ * schema too.
+ *
+ * It says nothing about which fields must be **present**, because the two calls
+ * want opposite things: extraction marks an absent fact by leaving the field out,
+ * and evaluation requires every field it defines. Each prompt states its own
+ * rule; a shared sentence that was true of one and false of the other would be
+ * worse than no sentence at all.
  *
  * @returns {string}
  */
 export function outputContractRule() {
   return [
     'Return exactly one JSON object matching the provided schema. No preamble, no',
-    'commentary after it, no markdown fence. Every field in the schema must be',
-    'present. Do not add a field the schema does not define - the response is',
-    'validated strictly and an extra key fails the whole document.',
+    'commentary after it, no markdown fence. Do not add a field the schema does',
+    'not define - the response is validated strictly and an extra key fails the',
+    'whole document.',
   ].join(' ');
 }
 

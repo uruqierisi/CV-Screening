@@ -8,6 +8,7 @@ import {
   AgentInputTooLargeError,
   AgentRateLimitError,
   AgentRefusalError,
+  AgentSchemaRejectedError,
   AgentTimeoutError,
   AgentUpstreamError,
 } from '../../src/agents/client/errors.js';
@@ -348,6 +349,121 @@ describe('transport failures, which the SDK has already retried twice', () => {
     expect(other.retryable).toBe(false);
   });
 
+  describe('a 400 that rejects the schema we sent', () => {
+    /** @param {string} message */
+    const rejectedSchema = (message) =>
+      new Anthropic.BadRequestError(
+        400,
+        { type: 'error', error: { type: 'invalid_request_error', message } },
+        undefined,
+        new Headers(),
+      );
+
+    /** The message that actually arrived, quoted exactly. */
+    const REAL_MESSAGE =
+      'Schemas contains too many parameters with union types (32 parameters with type ' +
+      'arrays or anyOf). This causes exponential compilation cost. Reduce the number of ' +
+      'nullable or union-typed parameters (limit: 16 parameters with unions).';
+
+    /**
+     * The **second** message that actually arrived, quoted exactly.
+     *
+     * The API enforces two independent caps, and fixing the first by trading
+     * every `.nullable()` for `.optional()` walked straight into the second.
+     * Nothing in the original signature list matched this prose, so a permanent
+     * fault in our own schema was reported as an upstream failure - which sends
+     * whoever reads the log to the network and the status page.
+     */
+    const REAL_OPTIONAL_MESSAGE =
+      'Schemas contains too many optional parameters (31), which would make grammar ' +
+      'compilation inefficient. Reduce the number of optional parameters in your tool ' +
+      'schemas (limit: 24).';
+
+    it('gives it its own code, because the fault is in this repository', async () => {
+      const error = await call({ client: failWith(rejectedSchema(REAL_MESSAGE)) }).catch(
+        (thrown) => thrown,
+      );
+
+      expect(error).toBeInstanceOf(AgentSchemaRejectedError);
+      expect(error.code).toBe('AGENT_SCHEMA_REJECTED');
+      // Never retryable. The request did not reach the model and will not until
+      // somebody edits a schema; retrying spends money to fail identically.
+      expect(error.retryable).toBe(false);
+      expect(error.details).toMatchObject({
+        stage: 'extraction',
+        status: 400,
+        signature: 'too_many_union_parameters',
+      });
+    });
+
+    it('keeps the upstream prose out of the log line', async () => {
+      // `details` records how the failure was recognised, not what upstream said
+      // about it. The signature id is ours; the message is not.
+      const error = await call({ client: failWith(rejectedSchema(REAL_MESSAGE)) }).catch(
+        (thrown) => thrown,
+      );
+
+      expect(JSON.stringify(error.toJSON())).not.toContain('exponential');
+      expect(error.message).toMatch(/configuration fault in the agent layer/);
+    });
+
+    it('recognises the optional-parameter cap as its own fault, not the union one', async () => {
+      const error = await call({ client: failWith(rejectedSchema(REAL_OPTIONAL_MESSAGE)) }).catch(
+        (thrown) => thrown,
+      );
+
+      expect(error).toBeInstanceOf(AgentSchemaRejectedError);
+      expect(error.retryable).toBe(false);
+      // Its own signature id, because the two caps send a reader to opposite
+      // edits: one wants fewer nullables, the other wants fewer optionals, and
+      // trading one for the other is what caused this in the first place.
+      expect(error.details.signature).toBe('too_many_optional_parameters');
+      expect(JSON.stringify(error.toJSON())).not.toContain('inefficient');
+    });
+
+    it.each([
+      ['a reworded union limit', 'Your schema has too many union-typed parameters.'],
+      ['a compilation-cost phrasing', 'This schema causes exponential compilation cost.'],
+      ['an unsupported construct', 'The output schema is not supported: recursive $ref.'],
+      ['a reworded optional limit', 'This schema declares too many optional parameters.'],
+      ['a grammar-compilation phrasing', 'That schema would make grammar compilation slow.'],
+    ])('recognises %s', async (_what, message) => {
+      const error = await call({ client: failWith(rejectedSchema(message)) }).catch(
+        (thrown) => thrown,
+      );
+      expect(error).toBeInstanceOf(AgentSchemaRejectedError);
+    });
+
+    it.each([
+      ['a 400 with no schema in it at all', 'max_tokens: must be greater than 0'],
+      ['a 400 that says schema but nothing this file knows', 'schema validation is enabled'],
+    ])('leaves %s exactly where it was', async (_what, message) => {
+      // The detection keys on upstream prose, which is fragile, so the important
+      // half of the guarantee is this one: a miss costs an improvement, never a
+      // behaviour. Anything unmatched is still an `AgentUpstreamError`.
+      const error = await call({ client: failWith(rejectedSchema(message)) }).catch(
+        (thrown) => thrown,
+      );
+
+      expect(error).toBeInstanceOf(AgentUpstreamError);
+      expect(error.code).toBe('AGENT_UPSTREAM');
+      expect(error.retryable).toBe(false);
+    });
+
+    it('ignores a 400 whose message is not a string', async () => {
+      const malformed = new Anthropic.BadRequestError(
+        400,
+        { type: 'error', error: { type: 'invalid_request_error' } },
+        undefined,
+        new Headers(),
+      );
+
+      await expect(call({ client: failWith(malformed) })).rejects.toBeInstanceOf(
+        AgentUpstreamError,
+      );
+    });
+  });
+
   it('distinguishes a call timeout from a candidate deadline', async () => {
     const timedOut = await call({
       client: failWith(new Anthropic.APIConnectionTimeoutError({})),
@@ -471,6 +587,187 @@ describe('the caller\'s own validation', () => {
 
   it('is optional, and its absence is not a branch anybody has to think about', async () => {
     await expect(call({ client: fakeAnthropic([ok]) })).resolves.toMatchObject({ attempts: 1 });
+  });
+});
+
+/**
+ * The unstructured path, which extraction takes.
+ *
+ * The point of every case here is that **nothing downstream of the response
+ * changed**. The same schema validates it, the same reasons come back, the same
+ * single retry is spent, and `invalid_json` was already a row in the matrix
+ * before this path existed - it is what a grammar-decoded response that never
+ * arrived used to look like. A second retry mechanism for "the model answered in
+ * prose" would have been a second budget for the same failure.
+ */
+describe('asking for JSON without sending a schema', () => {
+  const text = (overrides = {}) => call({ responseFormat: 'text', ...overrides });
+
+  it('sends no format, keeps the effort, and takes messages.create', async () => {
+    const client = fakeAnthropic([ok]);
+    await text({ client, effort: 'low', maxTokens: 6_000, timeoutMs: 120_000 });
+
+    const { params, options, method } = client.calls[0];
+
+    // The change itself. A format back on this request would compile a grammar
+    // and hang, which is what this whole path exists to avoid.
+    expect(method).toBe('create');
+    expect(params.output_config).not.toHaveProperty('format');
+    expect(params).not.toHaveProperty('output_format');
+    // `effort` belongs to `output_config`, not to the schema, so it survives.
+    expect(params.output_config.effort).toBe('low');
+    // Everything else about the request is unchanged.
+    expect(params.model).toBe(MODEL_ID);
+    expect(params.max_tokens).toBe(6_000);
+    expect(params.system).toBe(PROMPT.system);
+    expect(params.messages).toEqual([{ role: 'user', content: PROMPT.user }]);
+    expect(options.timeout).toBe(120_000);
+  });
+
+  it('validates the body against the same schema and returns the same result', async () => {
+    await expect(
+      text({ client: fakeAnthropic([{ ...ok, usage: { input_tokens: 9, output_tokens: 8 } }]) }),
+    ).resolves.toEqual({
+      data: { answer: 'forty-two' },
+      attempts: 1,
+      usage: { inputTokens: 9, outputTokens: 8 },
+      stopReason: 'end_turn',
+    });
+  });
+
+  it('accepts a response the model wrapped in a code fence, without a retry', async () => {
+    // The prompt forbids the fence; this is what stops the fraction of a percent
+    // that arrives with one anyway from costing a whole second generation.
+    const client = fakeAnthropic([{ text: '```json\n{"answer": "forty-two"}\n```' }]);
+
+    const result = await text({ client });
+
+    expect(result.data).toEqual({ answer: 'forty-two' });
+    expect(result.attempts).toBe(1);
+    expect(client.calls).toHaveLength(1);
+  });
+
+  it('sends a preamble down the ordinary invalid_json retry, not a repair path', async () => {
+    // Deliberately not rescued by hunting for the first brace: a preamble is a
+    // model doing something other than what it was told, and the retry says so
+    // in words the model can act on.
+    const client = fakeAnthropic([
+      { text: 'Sure! Here is the profile:\n```json\n{"answer": "forty-two"}\n```' },
+      ok,
+    ]);
+
+    const result = await text({ client });
+
+    expect(result.attempts).toBe(2);
+    expect(client.calls[1].params.messages[0].content).toContain('not valid JSON');
+    // The same shared budget, not a second one.
+    expect(client.calls).toHaveLength(SEMANTIC_RETRIES + 1);
+  });
+
+  it('fails as invalid_json when the second body is prose too', async () => {
+    const client = fakeAnthropic([{ text: 'no JSON here' }, { text: 'still none' }]);
+
+    const error = await text({ client }).catch((thrown) => thrown);
+
+    expect(error).toBeInstanceOf(AgentBadOutputError);
+    expect(error.reason).toBe('invalid_json');
+    expect(error.attempts).toBe(2);
+    expect(client.calls).toHaveLength(2);
+  });
+
+  it('feeds zod\'s paths back exactly as the structured path does', async () => {
+    const client = fakeAnthropic([{ json: { answer: 7 } }, ok]);
+
+    const result = await text({ client });
+
+    expect(result.attempts).toBe(2);
+    const retry = client.calls[1].params.messages[0].content;
+    expect(retry).toContain('did not match the required schema');
+    expect(retry).toContain('answer');
+  });
+
+  it('rejects a key the schema does not define, which strict parsing now has to catch', async () => {
+    // With a grammar the model could not emit `overallScore`. Without one it can,
+    // and `.strict()` is what makes that a loud failure instead of a stripped key.
+    const client = fakeAnthropic([
+      { json: { answer: 'forty-two', overallScore: 88 } },
+      { json: { answer: 'forty-two', overallScore: 88 } },
+    ]);
+
+    const error = await text({ client }).catch((thrown) => thrown);
+
+    expect(error.reason).toBe('schema_mismatch');
+    expect(error.details.issues).toEqual([{ path: '', code: 'unrecognized_keys' }]);
+    // The model is told which key it invented; the log is not. A zod message
+    // echoes the offending name, and `details` goes to a log line.
+    expect(client.calls[1].params.messages[0].content).toContain('overallScore');
+    expect(JSON.stringify(error.details)).not.toContain('overallScore');
+  });
+
+  it('retries a truncated body with a doubled budget, as it always did', async () => {
+    // Worth its own case on this path: without a grammar the model has more room
+    // to overrun, so this is the retry most likely to fire in practice.
+    const client = fakeAnthropic([
+      { stopReason: 'max_tokens', text: '{"answer": "forty-' },
+      ok,
+    ]);
+
+    const result = await text({ client, maxTokens: 6_000 });
+
+    expect(result.attempts).toBe(2);
+    expect(client.calls[0].params.max_tokens).toBe(6_000);
+    expect(client.calls[1].params.max_tokens).toBe(12_000);
+    expect(client.calls[1].method).toBe('create');
+    expect(client.calls[1].params.messages[0].content).toContain('cut off');
+  });
+
+  it('reads a response made entirely of thinking as no_output', async () => {
+    const client = fakeAnthropic([{ noText: true }, { noText: true }]);
+
+    const error = await text({ client }).catch((thrown) => thrown);
+
+    expect(error.reason).toBe('no_output');
+    expect(client.calls).toHaveLength(2);
+  });
+
+  it('never retries a refusal here either', async () => {
+    const client = fakeAnthropic([
+      { stopReason: 'refusal', stopDetails: { category: 'general_harms' } },
+      ok,
+    ]);
+
+    const error = await text({ client }).catch((thrown) => thrown);
+
+    expect(error).toBeInstanceOf(AgentRefusalError);
+    expect(client.calls).toHaveLength(1);
+  });
+
+  it('maps transport failures the same way, since none of that changed', async () => {
+    const client = fakeAnthropic([{ throws: new Anthropic.APIConnectionTimeoutError({}) }]);
+
+    const error = await text({ client, timeoutMs: 120_000 }).catch((thrown) => thrown);
+
+    expect(error).toBeInstanceOf(AgentTimeoutError);
+    expect(error.details).toMatchObject({ scope: 'call', limitMs: 120_000 });
+  });
+
+  it('defaults to the schema path, so a new call site gets the stricter one', async () => {
+    const client = fakeAnthropic([ok]);
+    await call({ client });
+
+    expect(client.calls[0].method).toBe('parse');
+    expect(client.calls[0].params.output_config.format.type).toBe('json_schema');
+  });
+
+  it('refuses a response format nobody defined, rather than silently dropping the schema', async () => {
+    // The one failure this parameter must not be able to cause quietly: a typo
+    // that turns a grammar-backed call into a free-text one costs nothing at
+    // request time and shows up as bad output much later.
+    const client = fakeAnthropic([ok]);
+
+    await expect(call({ client, responseFormat: 'json' })).rejects.toThrow(TypeError);
+    await expect(call({ client, responseFormat: 'json' })).rejects.toThrow(/responseFormat/);
+    expect(client.calls).toHaveLength(0);
   });
 });
 

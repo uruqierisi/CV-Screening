@@ -3,10 +3,15 @@
  *
  * Everything else in the agent layer takes `{ client, now, logger }` as an
  * argument. That single rule is what makes the whole test suite network-free
- * *without module mocking*: a test hands in a plain object with a
- * `messages.parse` method and every code path above this file runs unchanged.
- * Mocking a module would test the mock's shape; injecting a client tests the
- * code.
+ * *without module mocking*: a test hands in a plain object with `messages.parse`
+ * and `messages.create` methods and every code path above this file runs
+ * unchanged. Mocking a module would test the mock's shape; injecting a client
+ * tests the code.
+ *
+ * Two methods rather than one because the two calls ask for their JSON
+ * differently: evaluation sends a schema and uses `messages.parse`, extraction
+ * sends none and uses `messages.create`. Plan section 5.2 records the measurement
+ * that forced the split.
  *
  * The file does three things and no more, all of them local and none of them
  * I/O:
@@ -50,6 +55,7 @@ import { jsonSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/json-schema';
 // committed phase at 100% coverage - for no functional gain. Mechanics below.
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { AnthropicConfigurationError } from './errors.js';
+import { parseJsonResponse } from './json-response.js';
 
 /**
  * The model, as a constant rather than an environment variable.
@@ -123,14 +129,16 @@ export function createAnthropicClient({ apiKey, timeoutMs, maxRetries, baseURL }
 }
 
 /**
- * @typedef {{ ok: true, data: unknown }
- *   | { ok: false, kind: 'invalid_json' }
- *   | { ok: false, kind: 'schema_mismatch', issues: { path: string, code: string, message: string }[] }
- * } StructuredParseResult
+ * @typedef {import('./json-response.js').StructuredParseResult} StructuredParseResult
  */
 
 /**
  * Turns a zod schema into the object handed to `output_config.format`.
+ *
+ * **Only the evaluation call reaches this function now.** Extraction sends no
+ * schema at all - see `call-structured.js` and plan section 5.2 for the measured
+ * reason - so the grammar is compiled for the one task that is structured
+ * reasoning rather than transcription.
  *
  * Two decisions here, and both are worth stating because neither is the obvious
  * one.
@@ -178,33 +186,13 @@ export function toOutputFormat(schema) {
   return {
     type: 'json_schema',
     schema: format.schema,
-    parse: (content) => {
-      /** @type {unknown} */
-      let json;
-      try {
-        json = JSON.parse(content);
-      } catch {
-        // Almost always truncation. `stop_reason` is checked first and says so
-        // definitively; this is the fallback for a response that is malformed
-        // without having been cut off.
-        return { ok: false, kind: 'invalid_json' };
-      }
-
-      const result = schema.safeParse(json);
-      if (result.success) {
-        return { ok: true, data: result.data };
-      }
-
-      return {
-        ok: false,
-        kind: 'schema_mismatch',
-        issues: result.error.issues.map((issue) => ({
-          path: issue.path.join('.'),
-          code: String(issue.code),
-          message: issue.message,
-        })),
-      };
-    },
+    // The same parse the unstructured path uses, deliberately: one JSON parse,
+    // one schema validation and one discriminated result for both calls, so a
+    // failure means the same thing and takes the same retry whichever way the
+    // text arrived. Fence-stripping is *not* applied here - a grammar-decoded
+    // response cannot carry a fence, and stripping one would be dead code
+    // pretending to be a safeguard.
+    parse: (content) => parseJsonResponse(schema, content),
   };
 }
 

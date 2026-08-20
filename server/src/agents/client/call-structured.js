@@ -3,9 +3,31 @@
  * 5.4 applied to whatever comes back.
  *
  * This module never constructs a client and never imports the SDK. It is handed
- * one, calls `messages.parse` on it, and turns the result into either a
- * validated object or a typed error. That is what lets the entire suite exercise
- * every path in this file with a plain object as the client.
+ * one, calls `messages.parse` or `messages.create` on it, and turns the result
+ * into either a validated object or a typed error. That is what lets the entire
+ * suite exercise every path in this file with a plain object as the client.
+ *
+ * ## Two ways of asking for JSON, one way of judging the answer
+ *
+ * `responseFormat` picks between them and is the only thing in this file that
+ * differs between the two stages:
+ *
+ * | `responseFormat` | Request | Response read from | Used by |
+ * |---|---|---|---|
+ * | `json_schema` | `output_config.format` carries the schema | `parsed_output`, decoded against a grammar | evaluation |
+ * | `text` | no schema at all; the prompt carries the shape | the text block, parsed here | extraction |
+ *
+ * **Everything after the response is identical.** The same zod schema validates
+ * both, malformed JSON is `invalid_json` in both, a field of the wrong type is
+ * `schema_mismatch` in both, and both draw on the same single semantic retry.
+ * There is deliberately no second retry mechanism for the unstructured path: the
+ * matrix below already had a row for a response that is not JSON, because a
+ * grammar-decoded response could always fail to arrive at all.
+ *
+ * Why extraction gives up the grammar is a measurement, not a preference, and it
+ * is recorded in plan section 5.2: the API's compilation limit binds far below
+ * the documented caps, and it binds on schemas with several object arrays -
+ * which extraction has and evaluation does not.
  *
  * ## Two retry layers, owned by different people
  *
@@ -50,11 +72,13 @@ import {
   retryAfterSeconds,
   toOutputFormat,
 } from './anthropic-client.js';
+import { parseMessageJson } from './json-response.js';
 import {
   AgentBadOutputError,
   AgentInputTooLargeError,
   AgentRateLimitError,
   AgentRefusalError,
+  AgentSchemaRejectedError,
   AgentTimeoutError,
   AgentUpstreamError,
 } from './errors.js';
@@ -65,6 +89,20 @@ import {
  * a whole generation of real money.
  */
 export const SEMANTIC_RETRIES = 1;
+
+/**
+ * How the caller asks for JSON.
+ *
+ * `json_schema` is the default because it is the stricter of the two and a new
+ * call site should have to *choose* to give up the grammar rather than get that
+ * by forgetting a parameter.
+ *
+ * @type {{ JSON_SCHEMA: 'json_schema', TEXT: 'text' }}
+ */
+export const RESPONSE_FORMATS = Object.freeze({
+  JSON_SCHEMA: 'json_schema',
+  TEXT: 'text',
+});
 
 /** Stop reasons that mean the model finished saying what it had to say. */
 const COMPLETED_STOP_REASONS = Object.freeze(['end_turn', 'stop_sequence']);
@@ -105,10 +143,17 @@ const COMPLETED_STOP_REASONS = Object.freeze(['end_turn', 'stop_sequence']);
 
 /**
  * @param {object} params
- * @param {{ messages: { parse: Function } }} params.client injected, never constructed here
- * @param {any} params.schema the zod schema the response must satisfy
+ * @param {{ messages: { parse?: Function, create?: Function } }} params.client
+ *   injected, never constructed here. `parse` is called for `json_schema`,
+ *   `create` for `text`.
+ * @param {any} params.schema the zod schema the response must satisfy. Sent to
+ *   the API as a grammar on the `json_schema` path and used for validation on
+ *   both - there is one definition of the shape either way.
  * @param {{ system: string, user: string }} params.prompt from a `prompts/` template
  * @param {string} params.stage `extraction` or `evaluation`, for errors and logs
+ * @param {'json_schema' | 'text'} [params.responseFormat] whether the schema goes
+ *   on the wire as a decoding grammar. Defaults to `json_schema`; `text` is
+ *   extraction's deliberate exception and the prompt carries the shape instead.
  * @param {'low' | 'medium' | 'high' | 'xhigh' | 'max'} params.effort `output_config.effort`
  * @param {number} params.maxTokens doubled once if the first attempt truncates
  * @param {number} params.timeoutMs per-request deadline, **milliseconds**
@@ -125,6 +170,7 @@ export async function callStructured({
   schema,
   prompt,
   stage,
+  responseFormat = RESPONSE_FORMATS.JSON_SCHEMA,
   effort,
   maxTokens,
   timeoutMs,
@@ -133,7 +179,32 @@ export async function callStructured({
   validate,
   logger = NOOP_LOGGER,
 }) {
-  const format = toOutputFormat(schema);
+  // A typo here would silently drop the grammar from a call that is supposed to
+  // have one, which is the one failure this parameter must not be able to cause
+  // quietly. Programmer error, so it throws rather than joining the taxonomy.
+  if (!Object.values(RESPONSE_FORMATS).includes(responseFormat)) {
+    throw new TypeError(`callStructured: unknown responseFormat ${JSON.stringify(responseFormat)}`);
+  }
+
+  // Null on the `text` path, and that null is what every branch below switches
+  // on: no `output_config.format`, `messages.create` instead of `messages.parse`,
+  // and the response body parsed here instead of by the SDK.
+  const format =
+    responseFormat === RESPONSE_FORMATS.JSON_SCHEMA ? toOutputFormat(schema) : null;
+
+  /**
+   * The one difference between the two paths, reduced to a function: where the
+   * parse result comes from. `null` from either means "there was nothing to
+   * parse", which `inspect` reads as `no_output`.
+   *
+   * @param {any} message
+   * @returns {import('./json-response.js').StructuredParseResult | null}
+   */
+  const readOutput =
+    format === null
+      ? (message) => parseMessageJson(schema, message)
+      : (message) => message.parsed_output ?? null;
+
   const inputCharacters = prompt.system.length + prompt.user.length;
 
   /** @type {{ problem: string, issues?: { path: string, message: string }[] } | null} */
@@ -155,7 +226,7 @@ export async function callStructured({
       inputCharacters,
     });
 
-    const outcome = inspect({ message, stage, inputCharacters, validate });
+    const outcome = inspect({ message, stage, inputCharacters, validate, readOutput });
 
     if (outcome.ok) {
       return {
@@ -229,7 +300,17 @@ function giveUp(outcome, { stage, attempts }) {
 /**
  * One HTTP round trip, with every SDK failure mapped onto the taxonomy.
  *
- * @returns {Promise<any>} the parsed message
+ * `format === null` changes two things and nothing else: `output_config` carries
+ * the effort alone, and the request goes through `messages.create`.
+ * `messages.parse` exists to run the format's own parser over the response, so
+ * calling it without a format would be asking the SDK to decode against nothing.
+ *
+ * `effort` is sent either way. It is a property of `output_config` in its own
+ * right rather than a property of the schema, so dropping the grammar does not
+ * cost extraction its `low` setting - which is the biggest cost lever in the
+ * system.
+ *
+ * @returns {Promise<any>} the message
  */
 async function requestOnce({
   client,
@@ -247,17 +328,18 @@ async function requestOnce({
   const user =
     correction === null ? prompt.user : `${prompt.user}\n${retryNotice(correction)}`;
 
+  const request = {
+    model: MODEL_ID,
+    max_tokens: maxTokens,
+    system: prompt.system,
+    messages: [{ role: 'user', content: user }],
+    output_config: format === null ? { effort } : { format, effort },
+  };
+
   try {
-    return await client.messages.parse(
-      {
-        model: MODEL_ID,
-        max_tokens: maxTokens,
-        system: prompt.system,
-        messages: [{ role: 'user', content: user }],
-        output_config: { format, effort },
-      },
-      { timeout: timeoutMs, signal },
-    );
+    return format === null
+      ? await client.messages.create(request, { timeout: timeoutMs, signal })
+      : await client.messages.parse(request, { timeout: timeoutMs, signal });
   } catch (error) {
     throw toAgentError(error, { stage, timeoutMs, deadlineMs, inputCharacters });
   }
@@ -298,12 +380,7 @@ function toAgentError(error, { stage, timeoutMs, deadlineMs, inputCharacters }) 
       return new AgentUpstreamError({ stage, status, kind, retryable: true });
 
     case ANTHROPIC_ERROR_KINDS.BAD_REQUEST:
-      // A 400 for a request that is too long is a size problem, not a syntax
-      // problem, and the two need different messages in front of a recruiter.
-      // Any other 400 is a bug in this layer and repeating it changes nothing.
-      return isContextOverflow(error)
-        ? new AgentInputTooLargeError({ stage, inputCharacters })
-        : new AgentUpstreamError({ stage, status, kind, retryable: false });
+      return classifyBadRequest(error, { stage, status, kind, inputCharacters });
 
     default:
       // Authentication and anything unrecognised. Neither is worth a retry: a
@@ -314,11 +391,41 @@ function toAgentError(error, { stage, timeoutMs, deadlineMs, inputCharacters }) 
 }
 
 /**
+ * Sorts a 400 into the three things it can actually be.
+ *
+ * Three, not one, because they send whoever reads the log to three different
+ * places: the document is too big for the model, the schema we sent will not
+ * compile, or something else about the request is wrong. Only the last is a
+ * plain `AGENT_UPSTREAM`.
+ *
+ * @param {any} error
+ * @param {{ stage: string, status: number | null, kind: string, inputCharacters: number }} context
+ * @returns {Error}
+ */
+function classifyBadRequest(error, { stage, status, kind, inputCharacters }) {
+  // A 400 for a request that is too long is a size problem, not a syntax
+  // problem, and the two need different messages in front of a recruiter.
+  if (isContextOverflow(error)) {
+    return new AgentInputTooLargeError({ stage, inputCharacters });
+  }
+
+  const signature = schemaRejectionSignature(error);
+  if (signature !== null) {
+    return new AgentSchemaRejectedError({ stage, status, signature });
+  }
+
+  // Anything else is a bug in this layer and repeating it changes nothing. This
+  // is the fallback the schema check above must never swallow: an unrecognised
+  // 400 keeps exactly the behaviour it had before that check existed.
+  return new AgentUpstreamError({ stage, status, kind, retryable: false });
+}
+
+/**
  * Whether a 400 is the API saying the request did not fit.
  *
- * The one place this layer looks at a string from upstream, and it is confined
- * to an error *type* field rather than a message: `error.error.error.type` is the
- * API's own machine-readable code. A message can be reworded; this cannot.
+ * Confined to an error *type* field rather than a message:
+ * `error.error.error.type` is the API's own machine-readable code. A message can
+ * be reworded; this cannot.
  *
  * @param {any} error
  * @returns {boolean}
@@ -326,6 +433,70 @@ function toAgentError(error, { stage, timeoutMs, deadlineMs, inputCharacters }) 
 function isContextOverflow(error) {
   const type = error?.error?.error?.type;
   return type === 'context_window_exceeded' || type === 'request_too_large';
+}
+
+/**
+ * The phrases that identify a schema-compilation rejection.
+ *
+ * **This is fragile and it is worth being blunt about why.** Unlike context
+ * overflow above, this failure has no machine-readable `type` of its own: it
+ * arrives as a generic `invalid_request_error` whose only distinguishing feature
+ * is the prose in its `message`. Matching on upstream prose is exactly what the
+ * rest of this layer refuses to do - a reworded message silently stops matching,
+ * and nothing fails until an operator is staring at the wrong error code.
+ *
+ * It is still worth doing, because the alternative is worse: a permanent fault
+ * in our own schemas reported as an upstream failure sends every future reader
+ * to the network, the rate limit and Anthropic's status page, none of which is
+ * the problem.
+ *
+ * Two things bound the fragility:
+ *
+ * - **A miss is not a regression.** An unmatched 400 falls through to
+ *   `AgentUpstreamError`, which is precisely what it was before this existed.
+ *   The failure mode of these patterns is losing an improvement, never breaking
+ *   a behaviour.
+ * - **The real defence is upstream of the network.**
+ *   `test/agents/schema-budget.test.js` counts union-typed parameters in
+ *   the generated JSON Schema and fails above the documented limit, so this code
+ *   path should never run. It exists for the compilation limit nobody has
+ *   discovered yet.
+ *
+ * Each entry keeps its `id` in the error's `details` rather than the matched
+ * text, so a log line records how the failure was recognised without quoting
+ * upstream prose back into our own logs.
+ *
+ * @type {readonly { id: string, pattern: RegExp }[]}
+ */
+const SCHEMA_REJECTION_SIGNATURES = Object.freeze([
+  // The live one, from the message quoted in `AgentSchemaRejectedError`.
+  { id: 'too_many_union_parameters', pattern: /parameters with (?:type arrays|unions)/i },
+  { id: 'union_compilation_cost', pattern: /union[- ]typed parameters|exponential compilation/i },
+  // The second live one. The API enforces two independent caps - unions and
+  // optionals - and fixing the first by trading `.nullable()` for `.optional()`
+  // walked straight into the second. Its own id, because the two send a reader
+  // to opposite edits.
+  {
+    id: 'too_many_optional_parameters',
+    pattern: /too many optional parameters|optional parameters in your tool schemas|grammar compilation/i,
+  },
+  { id: 'schema_unsupported', pattern: /schema[^.]{0,80}(?:not supported|unsupported|too (?:deep|large|complex))/i },
+]);
+
+/**
+ * @param {any} error
+ * @returns {string | null} the id of the signature that matched, or null
+ */
+function schemaRejectionSignature(error) {
+  const message = error?.error?.error?.message;
+  if (typeof message !== 'string' || !/schema/i.test(message)) {
+    // Every known phrasing names the schema. Requiring that keeps a 400 about
+    // some unrelated parameter from being blamed on this file's schemas.
+    return null;
+  }
+
+  const matched = SCHEMA_REJECTION_SIGNATURES.find(({ pattern }) => pattern.test(message));
+  return matched === undefined ? null : matched.id;
 }
 
 /**
@@ -347,11 +518,15 @@ function isContextOverflow(error) {
  * @param {string} params.stage
  * @param {number} params.inputCharacters
  * @param {((data: any) => ValidationRejection | null) | undefined} params.validate
+ * @param {(message: any) => import('./json-response.js').StructuredParseResult | null} params.readOutput
+ *   where the parse result comes from on this path. Injected rather than
+ *   branched on here, so that the order below - stop reason first, output second
+ *   - is stated once and is the same for both.
  * @returns {Inspection}
  * @throws {AgentRefusalError} never retried, at either layer
  * @throws {AgentInputTooLargeError} the same input overflows the same way twice
  */
-function inspect({ message, stage, inputCharacters, validate }) {
+function inspect({ message, stage, inputCharacters, validate, readOutput }) {
   const stopReason = message.stop_reason ?? null;
 
   if (stopReason === 'refusal') {
@@ -388,7 +563,9 @@ function inspect({ message, stage, inputCharacters, validate }) {
     };
   }
 
-  const parsed = message.parsed_output ?? null;
+  // Read only after `stop_reason` has been ruled on, which is why this is a
+  // function and not a value computed alongside the message.
+  const parsed = readOutput(message);
 
   if (parsed === null) {
     // No text block at all - a response made entirely of thinking, or an empty

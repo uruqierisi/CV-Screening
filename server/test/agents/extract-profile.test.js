@@ -2,12 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   EXTRACTION_EFFORT,
   EXTRACTION_MAX_TOKENS,
+  EXTRACTION_RESPONSE_FORMAT,
   EXTRACTION_TIMEOUT_MS,
   extractProfile,
 } from '../../src/agents/extraction/extract-profile.js';
 import { AgentInputError } from '../../src/agents/client/errors.js';
 import { fakeAnthropic } from './helpers/fake-anthropic.js';
-import { GOLDEN_CV_TEXT, GOLDEN_PROFILE } from './fixtures/golden.js';
+import { GOLDEN_CV_TEXT, GOLDEN_PROFILE, extractedProfile } from './fixtures/golden.js';
 
 /**
  * Extraction as a whole: the guard, the call, and the three deterministic steps
@@ -21,19 +22,11 @@ import { GOLDEN_CV_TEXT, GOLDEN_PROFILE } from './fixtures/golden.js';
 
 const NOW = new Date('2026-03-15T09:30:00.000Z');
 
-/** The model's own output shape: no `computedYearsExperience`, no `evidenceVerified`. */
-function modelProfile(overrides = {}) {
-  const { computedYearsExperience, skills, ...rest } = GOLDEN_PROFILE;
-  return {
-    ...rest,
-    skills: skills.map(({ name, evidenceType, evidenceQuote }) => ({
-      name,
-      evidenceType,
-      evidenceQuote,
-    })),
-    ...overrides,
-  };
-}
+/**
+ * The model's own output shape: flat location, absent keys where the CV is
+ * silent, and none of the fields code derives afterwards.
+ */
+const modelProfile = extractedProfile;
 
 const extract = (client, overrides = {}) =>
   extractProfile({ client, cvText: GOLDEN_CV_TEXT, now: NOW, ...overrides });
@@ -79,6 +72,54 @@ describe('the call', () => {
     // Milliseconds, and two minutes rather than two seconds.
     expect(EXTRACTION_TIMEOUT_MS).toBe(120_000);
     expect(client.calls[0].options.timeout).toBe(120_000);
+  });
+
+  it('asks for JSON in the body and attaches no schema to the request', async () => {
+    const client = fakeAnthropic([{ json: modelProfile() }]);
+    await extract(client);
+
+    const { params, method } = client.calls[0];
+
+    // The measured reason is on `EXTRACTION_RESPONSE_FORMAT` and in plan
+    // section 5.2: this schema cannot be compiled into a grammar in a usable
+    // time, and the failure is a two-minute hang rather than an error.
+    expect(EXTRACTION_RESPONSE_FORMAT).toBe('text');
+    expect(method).toBe('create');
+    expect(params.output_config).not.toHaveProperty('format');
+    // Effort is not part of the schema and does not go with it.
+    expect(params.output_config.effort).toBe('low');
+  });
+
+  it('still validates the response against the extraction schema', async () => {
+    // The guarantee was always zod's, not the decoder's. A profile with a field
+    // of the wrong type fails exactly as it did when a grammar was attached.
+    const client = fakeAnthropic([
+      { json: modelProfile({ statedYearsExperience: 'nine' }) },
+      { json: modelProfile({ statedYearsExperience: 'nine' }) },
+    ]);
+
+    const error = await extract(client).catch((thrown) => thrown);
+
+    expect(error.code).toBe('AGENT_BAD_OUTPUT');
+    expect(error.reason).toBe('schema_mismatch');
+    expect(error.details.issues).toContainEqual({
+      path: 'statedYearsExperience',
+      code: 'invalid_type',
+    });
+  });
+
+  it('accepts a profile the model wrapped in a code fence, without a second call', async () => {
+    // The prompt tells it not to. Models mostly obey and occasionally reach for
+    // the habit, and three backticks are not worth a second generation.
+    const client = fakeAnthropic([
+      { text: `\`\`\`json\n${JSON.stringify(modelProfile())}\n\`\`\`` },
+    ]);
+
+    const { profile, diagnostics } = await extract(client);
+
+    expect(profile.fullName).toBe(GOLDEN_PROFILE.fullName);
+    expect(diagnostics.attempts).toBe(1);
+    expect(client.calls).toHaveLength(1);
   });
 
   it('sends the CV and no role information whatsoever', async () => {

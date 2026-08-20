@@ -103,6 +103,55 @@ export class AgentInputTooLargeError extends AgentError {
 }
 
 /**
+ * The API rejected the output schema this layer sent.
+ *
+ * **A configuration fault in this repository, not an upstream problem.** The
+ * request never reached the model: the API compiles the JSON Schema in
+ * `output_config.format` into a decoding grammar, and it refused to compile
+ * ours. The live example, and the reason this class exists:
+ *
+ * > "Schemas contains too many parameters with union types (32 parameters with
+ * > type arrays or anyOf). This causes exponential compilation cost. Reduce the
+ * > number of nullable or union-typed parameters (limit: 16 parameters with
+ * > unions)."
+ *
+ * Not retryable, and that is the whole point of separating it from
+ * {@link AgentUpstreamError}. Both are 400s that will not fix themselves, but
+ * `AGENT_UPSTREAM` tells whoever reads the log to look outward - the network,
+ * the rate limit, Anthropic's status page - and every one of those is the wrong
+ * place. The thing to change is a schema in `src/agents/schemas/`, and it will
+ * fail identically for every candidate in every batch until somebody does.
+ *
+ * `details` carries the stage and the id of the signature that matched, never
+ * the upstream message: the message is prose we do not control, and the
+ * codebase's rule is that only structural facts reach a log line.
+ */
+export class AgentSchemaRejectedError extends AgentError {
+  /**
+   * @param {object} params
+   * @param {string} params.stage `extraction` or `evaluation`
+   * @param {number | null} params.status the HTTP status, in practice 400
+   * @param {string} params.signature which detection pattern matched, so a log
+   *   line says *how* this was recognised - see `call-structured.js` on why that
+   *   matters more here than elsewhere
+   */
+  constructor({ stage, status, signature }) {
+    super(
+      `the model API rejected the ${stage} output schema; this is a configuration fault in the agent layer, not an upstream failure`,
+      {
+        code: AGENT_ERROR_CODES.SCHEMA_REJECTED,
+        details: { stage, status, signature },
+        retryable: false,
+      },
+    );
+    /** @type {string} */
+    this.stage = stage;
+    /** @type {string} */
+    this.signature = signature;
+  }
+}
+
+/**
  * The call did not finish inside its deadline.
  *
  * Two deadlines produce this, and `details.scope` says which, because they mean
