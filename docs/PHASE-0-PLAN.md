@@ -277,7 +277,8 @@ Base `/api/v1`. Success `{ data, meta? }`. Error `{ error: { code, message, deta
 Every param, query and body is zod-parsed in the controller; unknown keys stripped.
 
 ```
-GET    /api/v1/config              upload limits, elimination-rule-type descriptors, tier thresholds
+GET    /api/v1/config              upload limits, rule-type descriptors, tier thresholds,
+                                   status vocabulary + which statuses are terminal
 POST   /api/v1/roles               create role + criteria + rules in one transaction
 GET    /api/v1/roles               list (paginated)
 GET    /api/v1/roles/:roleId       full definition
@@ -286,7 +287,8 @@ DELETE /api/v1/roles/:roleId       soft archive; idempotent; never a hard delete
 POST   /api/v1/roles/:roleId/candidates        single upload  → 202
 POST   /api/v1/roles/:roleId/candidates/batch  batch upload   → 202
 GET    /api/v1/jobs/:jobId                     derived job status + counts
-GET    /api/v1/candidates                      ranked list, filtered, paginated
+GET    /api/v1/candidates                      ranked list, filtered, paginated;
+                                               ?status= one, ?statusIn= a set of them
 GET    /api/v1/candidates/statuses?ids=a,b,c   lightweight poll payload
 GET    /api/v1/candidates/:candidateId         full detail
 POST   /api/v1/candidates/:candidateId/retry   re-enqueue a terminally failed candidate → 202
@@ -296,6 +298,30 @@ GET    /api/v1/health                          liveness + db/redis reachability
 **Rate limiting** (`@fastify/rate-limit`) is applied to the two upload endpoints only — they
 are the ones that spend real API money. With no auth the only principal is the client IP,
 which bounds how much this actually buys; it is a cost guard, not a security control.
+
+**CORS is part of this surface as of phase 5** (`@fastify/cors`, registered before the routes),
+and its absence is recorded here because the reason it went unnoticed is instructive. The browser
+client worked without it — but only because Vite's dev server proxies `/api`, so the browser never
+made a cross-origin request at all. That is a property of the dev server, not of this API, and it
+stops being true the moment the two halves are deployed to two origins. "It works because of a
+dev-server proxy" is a bad answer for anybody deploying this.
+
+**An allowlist, `CORS_ALLOWED_ORIGINS`, defaulting to the development origin** —
+`http://localhost:5173`, which is Vite's default and what `web/vite.config.js` pins its dev server
+to. Deliberately **not** `*`: a wildcard is the option that never fails, so a deployment that never
+configures this would answer any page on the internet and nobody would ever discover the omission.
+A dev-origin default means a production deployment that has not set the variable fails immediately
+and visibly on its first real request — found by whoever is deploying rather than by whoever is
+attacked. The value is zod-parsed at startup like every other variable, and each entry must be a
+bare origin (scheme, host, optional port — no path, no trailing slash), because that is what a
+browser actually sends and an entry carrying a path silently matches nothing. A literal `*` does
+not disable the allowlist either: it fails that check and stops the process.
+
+`credentials` is off — there is no auth, so no request carries a cookie or an `Authorization`
+header, and enabling it would grant a permission nothing uses. `Retry-After` and the rate-limit
+counters are in `exposedHeaders`: none of them is CORS-safelisted, and a cross-origin client that
+can see a 429 but not the header saying when to come back cannot implement the row for
+`RATE_LIMITED` in the table below.
 
 **Retry** clears `error_code` / `error_message` / `completed_at`, sets `status` back to
 `pending`, bumps `attempts`, and re-enqueues under a fresh queue-job id, since the original id is
@@ -321,6 +347,24 @@ said the opposite.
 
 `GET /api/v1/config` exists so upload limits, rule-type descriptors and tier thresholds are
 defined **once, server-side**, instead of being duplicated as client constants that drift.
+
+**Phase 5 added `candidates.terminalStatuses` to that payload, and it is the same argument one
+step further.** The section already published `candidates.statuses` — the five values the column
+can hold — and stopped there, which left the *stop condition* unpublished. A dashboard polls until
+a candidate is `done` or `failed`; with only the vocabulary on the wire, every client had to
+restate that pair for itself. It was the last duplicated constant in the frontend, and a stop
+condition is the worst possible thing to keep two copies of — a copy that is a status behind polls
+forever, and a copy that is a status ahead stops on a candidate still being screened.
+
+The list is **derived, not written a second time.** The status vocabulary is now a map from status
+to "is it terminal", and both `statuses` and `terminalStatuses` fall out of it, so a sixth status
+cannot be added without answering the question. A schema test reads the column's own CHECK out of
+the live catalogue and asserts that the terminal and non-terminal lists partition it exactly —
+which makes the *migration* adding a sixth status the thing that fails, rather than the poll.
+
+Found by building a real client against this contract, which is the only way this class of gap
+surfaces: the server was never wrong about anything it published, it was wrong about what it left
+out, and nothing on the server side notices an omission.
 
 **Upload** (`202`): `{ jobId, roleId, candidates: [{ id, originalFilename, status, duplicate }] }`,
 with `meta: { fileCount, created, duplicates }`.
@@ -351,6 +395,40 @@ rather than looking like data loss.
 matchScore, fitCategory, eliminated, eliminatedBy, errorCode, createdAt, completedAt }`,
 with `meta: { page, pageSize, total, totalPages, counts: { strong_match, potential_match,
 unmatched } }`. The counts cannot be derived from a 25-row page.
+
+**Candidate list query:** `roleId`, `jobId`, `fitCategory`, `status`, `statusIn`, `sort`, `page`,
+`pageSize`. Every one is zod-parsed in the controller; `fitCategory`, `status`, `statusIn` and
+`sort` are enums, which is what makes the repository's "only fixed column names are interpolated"
+true rather than merely intended.
+
+**`statusIn` is a phase 5 addition, and the ruling behind it is worth recording: four parallel
+requests to express one filter is the API being wrong, not the client being clever.** The query
+accepted a single `status`, so "everything still working, plus everything that failed" — which is
+one panel on the dashboard — was not expressible in one request, and the client was issuing four
+filtered requests and merging them. That is four round trips, four pagination windows that cannot
+be reconciled, and three `meta.counts` objects thrown away.
+
+`?statusIn=pending,parsing,evaluating,failed`: comma-separated, over the same enum, capped at the
+number of statuses that exist. Comma-separated because `/candidates/statuses?ids=` already is, and
+one canonical encoding means one thing to validate. Capped at five because a longer list is a
+client repeating a value, and the answer to that is a `400` rather than a bigger query — so the
+array reaching SQL is bounded by the column's own CHECK whatever the query string says. It reaches
+Postgres as `status = ANY($n::text[])`: **one bound array, never a comma-joined `IN` built from the
+query string.** That is the injection surface closed, and it also means the placeholder count does
+not depend on how many statuses were asked for, so `LIMIT` and `OFFSET` cannot slip a position —
+the off-by-one a hand-built `IN ($4,$5,$6)` invites.
+
+**The single `status` param stays, unchanged.** Both filter the same column and both are applied,
+composing with `AND` exactly as `roleId` and `jobId` do — `?status=done&statusIn=done,failed` means
+`done`, and a contradictory pair is an empty page rather than an error.
+
+Two parameters filtering one column is a wart, and it is recorded as one rather than left to be
+discovered. The cleaner design is to widen `status` itself to accept a list, which is
+backwards-compatible for every caller that sends a single value; it was not done here because a
+client already in flight sends `status`, and changing what that parameter parses to underneath a
+client in another lane is not this change's business. **Retiring `status` in favour of `statusIn`,
+or folding the two into one parameter, is an open decision for the project owner** — noted, not
+taken.
 
 Not-yet-scored candidates sort **last** in both directions, so an in-progress batch never
 pushes real results off page 1.
@@ -1271,12 +1349,49 @@ README is in §4.
   awards 85+ to a candidate with two named gaps may be behaving exactly as intended.
 
   What it is: the first concrete instance of the question, and a calibration of how far off 85
-  a plainly strong candidate can land. What would settle it: the 30–50 labelled CVs above, with
-  a recruiter's own Strong/Potential/Unmatched label per CV, and agreement measured against the
-  computed tier. Until that exists, moving the threshold on one datapoint would be substituting
-  our intuition for theirs — which is the failure the harness exists to prevent.
-- **Extraction is a single point of failure.** Every rating, elimination and score depends on
-  one non-deterministic call, and evaluation cannot see past it.
+  a plainly strong candidate can land.
+
+  **Second datapoint, same day, and it is the more interesting one.** The phase 3 fixture CV —
+  a plain single-column document describing a senior backend engineer at a payments company —
+  screened through the live pipeline and scored **50**, landing **Unmatched**.
+
+  One criterion drives almost all of the gap. *Backend engineering depth (Node.js)* was rated
+  **3/10** because Node.js appears in the CV only as a skills-list entry, never tied to a piece
+  of work. That criterion carries **30%**, so on its own it costs **21 points** of the 50 that
+  were lost. The model's stated reason is defensible: the CV never connects the runtime to
+  anything the candidate did.
+
+  **This is the evidence-discipline tradeoff, now measured rather than predicted.** The
+  `evidenceType: 'demonstrated' | 'listed_only'` distinction in §5.1 exists precisely so a
+  keyword list cannot buy a rating, and here it did exactly that. The consequence is that **the
+  system is stricter than a human recruiter would be** — a person reading "Senior Backend
+  Engineer at a payments company" infers Node.js and rates it far higher.
+
+  That may be exactly right for a screener whose whole purpose is not to be fooled by a skills
+  section. It is nonetheless **a design decision, and it is recorded here as one** rather than
+  left for a reviewer to discover and reasonably conclude the scoring is broken.
+
+  **What the two datapoints together mean.** 81.5 for a CV whose evidence is explicit, 50 for a
+  CV whose claims are real but unevidenced, on the same rubric. The spread is not noise — it is
+  the evidence rule doing what it was built to do, and the open question is whether it is
+  calibrated or overtuned.
+
+  What would settle it: the 30–50 labelled CVs above, with a recruiter's own
+  Strong/Potential/Unmatched label per CV, and agreement measured against the computed tier.
+  That harness distinguishes the two possible faults, which no amount of reasoning from here
+  can: **the bands are wrong** (85 and 65 sit in the wrong place) or **the evidence rule is too
+  strict** (`listed_only` should not cost as much as it does). They need opposite fixes, and
+  moving either on two datapoints would be substituting our intuition for a recruiter's — which
+  is the failure the harness exists to prevent.
+- **A test that passes only because nobody has used the app yet is not passing.** From phase 4
+  until phase 5 the test suite shared its upload root with development, and three upload tests
+  asserted "no file was written" by counting every file under that root. They were green for as
+  long as the directory was empty — that is, for as long as nobody had actually run the system.
+  The first real upload turned three unrelated tests red, in exactly the sequence a reviewer
+  follows: run the app, screen a CV, run the tests, conclude the project is broken. Fixed by
+  giving the suite a root it owns and cleans, but the general lesson is recorded here rather
+  than in a commit message: a test whose fixture is shared mutable state outside the test is
+  making an assumption about the world, and the assumption is usually "nothing has happened yet".
 - **Local disk means the API and worker must share a filesystem.** This does not scale
   horizontally as written; S3 the day it needs two nodes. The sharpest architectural limit here.
 - **No rescore path after a role edit.** Old scores persist, stamped with `scored_role_version`,
