@@ -11,15 +11,6 @@ code against extracted facts. Everything a recruiter acts on is either arithmeti
 check or a quote they can read.
 
 ---
-
-## A note on AI assistance
-
-> This project was built with AI assistance under my direction. The architectural decisions are
-> mine — the data model, the split between what the model judges and what code computes, the
-> phase structure, and every trade-off recorded in [`docs/PHASE-0-PLAN.md`](docs/PHASE-0-PLAN.md).
-
----
-
 ## Setup
 
 ### Prerequisites
