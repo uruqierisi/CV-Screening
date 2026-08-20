@@ -168,14 +168,56 @@ describe('the agent layer imports nothing it should not', () => {
     // `test/extraction/boundaries.test.js` asserts that confinement. It is
     // named here rather than exempted because a manifest check that ignores
     // half the manifest checks nothing.
+    //
+    // Phase 4 added six, every one of them named in the plan of record's stack
+    // (section 0) or forced by one that is, and none of them reachable from
+    // `src/agents/**` - the import check above is what enforces that:
+    //
+    //   fastify              the HTTP framework the plan chose
+    //   @fastify/multipart   uploads; the alternative is hand-parsing multipart
+    //   @fastify/rate-limit  section 3 names it, on the two upload endpoints
+    //   bullmq               the queue the plan chose (section 7-G)
+    //   ioredis              bullmq's Redis client - an optional peer dependency
+    //                        it does not install, so it has to be declared here
+    //   pino                 fastify's own logger, imported directly by the
+    //                        worker, which has no fastify instance to borrow one
+    //                        from
     const pkg = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8'));
     expect(Object.keys(pkg.dependencies).sort()).toEqual([
       '@anthropic-ai/sdk',
+      '@fastify/multipart',
+      '@fastify/rate-limit',
+      'bullmq',
+      'fastify',
+      'ioredis',
       'pg',
+      'pino',
       'unpdf',
       'zod',
       'zod-to-json-schema',
     ]);
+  });
+
+  it('keeps every phase 4 dependency out of the two framework-agnostic layers', () => {
+    // The rule the plan states in section 0 and section 5: `src/agents/` imports
+    // no web framework and no DB driver, and `src/extraction/` is the same shape.
+    // Six packages arrived in phase 4 and not one of them may cross either line -
+    // the worker composes these layers, it does not let them learn about a queue.
+    const phase4 = [
+      'fastify',
+      '@fastify/multipart',
+      '@fastify/rate-limit',
+      'bullmq',
+      'ioredis',
+      'pino',
+    ];
+
+    for (const file of AGENT_FILES) {
+      const imports = runtimeImports(readFileSync(file, 'utf8'));
+      for (const specifier of imports) {
+        expect(phase4, `${file} imports ${specifier}`).not.toContain(specifier);
+      }
+    }
   });
 
   it('keeps prompt text out of the modules that have behavioural tests', () => {
