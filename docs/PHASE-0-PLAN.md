@@ -974,6 +974,14 @@ Worker-side codes stored on the candidate: `EXTRACTION_FAILED`, `EMPTY_DOCUMENT`
 `AGENT_INCOMPLETE_EVAL`, `AGENT_INPUT_TOO_LARGE`, `AGENT_SCHEMA_REJECTED`,
 `AGENT_INVALID_ROLE`, `AGENT_UNKNOWN_RULE`, `SOURCE_FILE_MISSING`.
 
+**`UNSUPPORTED_FILE_TYPE` is deliberately not in this namespace, and phase 4 must map it as a
+415 at upload.** It is an HTTP-layer rejection (§3), not a worker-side candidate error, because
+a file whose bytes we cannot read **never becomes a candidate row** — so there is no
+`candidates.error_code` to store it in. Phase 3 exports `sniffMimeType` for exactly this: the
+upload endpoint sniffs the bytes, and a type outside §2's allowlist is refused before anything
+is written. Recorded here so phase 4 maps it on purpose rather than rediscovering the gap and
+inventing a worker code that nothing could ever set.
+
 `AGENT_INPUT_TOO_LARGE` was added during phase 2b and is not in the original list: a CV that
 overflows the context window is neither bad output nor an empty document, and collapsing it
 into either would tell a recruiter to fix the wrong thing.
@@ -1211,8 +1219,35 @@ README is in §4.
   horizontally as written; S3 the day it needs two nodes. The sharpest architectural limit here.
 - **No rescore path after a role edit.** Old scores persist, stamped with `scored_role_version`,
   and the dashboard will show candidates scored under different rubrics side by side.
+- **A CV with a single work entry and no end date computes confidently as current**, because
+  there is no later role to supersede it — the correct reading of the CV convention, and also
+  the exact shape someone would use to game a `min_years_experience` requirement.
+- **Table-based two-column CV templates interleave.** Measured in phase 3 against a real
+  fixture, not predicted. A CV laid out as a two-column *table* extracts with the columns
+  welded together line by line — `EXPERIENCE SKILLS`, then `Senior Backend Engineer Node.js`,
+  a job title against a technology and a date range against a skill.
+
+  The distinction is sharp and worth keeping sharp: **column-section layouts extract cleanly**
+  — Word columns, InDesign text frames, LaTeX `multicol` — because the producer emits one
+  column's content before the next. The same ink at the same coordinates, emitted column-major,
+  comes out perfectly ordered. It is the *producer's* content-stream order that decides this,
+  not the visual layout, so "two-column CV" is not the predictor; "two-column table" is.
+
+  **What a recruiter sees when it happens:** the interleaved text still passes `assessCvText`
+  and still reaches the model, so the candidate is scored — with lower ratings and reasons that
+  cite the mangled evidence. That is the intended failure mode per §7-C: a degraded rating with
+  its evidence visible beats a silent disappearance into Tier 3, because a human reading the
+  detail view can see the extraction went wrong and re-upload.
+
+  **Column reconstruction was declined.** Clustering text by x-position would also fire on the
+  right-aligned date gutter that most *single*-column CVs have, so it would corrupt the common
+  case to rescue the rare one. Breaking CVs that currently extract correctly, to partially fix
+  CVs that never did, is the wrong trade.
+
 - **Non-English and non-Western-format CVs** will extract poorly. No adequate mitigation; it
-  belongs on the risk register, not in a mitigation column.
+  belongs on the risk register, not in a mitigation column. Distinct from the item above: that
+  one is a layout-producer problem with a known cause, this one is a language and
+  date-convention problem with no cause we can address.
 - **Regulatory exposure.** Automated candidate screening touches the EU AI Act, NYC Local Law
   144, and GDPR Art. 22. The architecture does the right things — every rating, reason, evidence
   quote and elimination reason is retained and attributable, and code decides so the decision is
