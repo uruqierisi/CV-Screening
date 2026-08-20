@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
+import { TEST_UPLOAD_ROOT } from './test/uploadRoot.js';
 
 // The suite runs against a real PostgreSQL from docker-compose, so it needs the
 // same .env a developer uses. Node's built-in loader is used rather than adding
@@ -86,6 +87,19 @@ export default defineConfig({
           fileParallelism: false,
           env: {
             NODE_ENV: 'test',
+            // The suite gets its own upload root, and owns it.
+            //
+            // Until now it shared `./uploads` with development, and three tests
+            // assert `uploadedFileCount() === 0` after a rejected upload by
+            // counting every file under the root. That passed for as long as
+            // nobody had actually used the app: the first real upload put a file
+            // there, and three tests went red for a reason that had nothing to
+            // do with them. A test that passes only because nobody has used the
+            // app yet is not passing.
+            //
+            // `globalSetup` empties this before the run and removes it after, so
+            // the count starts at zero and the repository is left clean.
+            UPLOAD_ROOT: TEST_UPLOAD_ROOT,
           },
           testTimeout: 20_000,
           hookTimeout: 30_000,
