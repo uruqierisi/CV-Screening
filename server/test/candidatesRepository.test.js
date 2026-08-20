@@ -313,21 +313,49 @@ describe('findCandidateStatusesByIds', () => {
 });
 
 describe('findDuplicateCandidates', () => {
-  it('finds prior uploads of identical content for the same role', async () => {
+  it('finds the candidate already holding this content for the role', async () => {
     const { role } = await createRole();
     const sha = 'b'.repeat(64);
     const { candidates } = await createScreeningJob({
       roleId: role.id,
-      candidates: [{ contentSha256: sha }, { contentSha256: sha }, { contentSha256: 'c'.repeat(64) }],
+      candidates: [{ contentSha256: sha }, { contentSha256: 'c'.repeat(64) }],
     });
 
     const duplicates = await findDuplicateCandidates(pool, {
       roleId: role.id,
       contentSha256: sha,
-      excludeCandidateId: candidates[0].id,
     });
 
-    expect(duplicates.map((row) => row.id)).toEqual([candidates[1].id]);
+    expect(duplicates.map((row) => row.id)).toEqual([candidates[0].id]);
+  });
+
+  it('cannot find a second copy for one role, because the schema forbids one', async () => {
+    const { role } = await createRole();
+    const sha = 'e'.repeat(64);
+    await createScreeningJob({ roleId: role.id, candidates: [{ contentSha256: sha }] });
+
+    // Migration 0008. This is the guarantee the upload path's ON CONFLICT relies
+    // on, asserted from the outside rather than assumed.
+    await expect(
+      createScreeningJob({ roleId: role.id, candidates: [{ contentSha256: sha }] }),
+    ).rejects.toThrow(/candidates_role_content_sha256_key/);
+  });
+
+  it('excludes a candidate the caller already knows about', async () => {
+    const { role } = await createRole();
+    const sha = 'f'.repeat(64);
+    const { candidates } = await createScreeningJob({
+      roleId: role.id,
+      candidates: [{ contentSha256: sha }],
+    });
+
+    expect(
+      await findDuplicateCandidates(pool, {
+        roleId: role.id,
+        contentSha256: sha,
+        excludeCandidateId: candidates[0].id,
+      }),
+    ).toEqual([]);
   });
 
   it('does not match the same content uploaded against a different role', async () => {

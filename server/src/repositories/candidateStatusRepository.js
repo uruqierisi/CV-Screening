@@ -222,3 +222,37 @@ export async function resetCandidateForRetry(db, candidateId) {
     params: [candidateId],
   });
 }
+
+/**
+ * parsing | evaluating -> pending, releasing a candidate for another queue
+ * attempt.
+ *
+ * This is the worker's rollback, and it exists because the claim is guarded.
+ * `markCandidateParsing` only moves `pending -> parsing`, so a candidate left in
+ * `parsing` by a transient failure could never be re-claimed by BullMQ's next
+ * attempt - the guard would reject it and the retry would do nothing. Rolling
+ * the status back is what makes the guard and the retry policy compatible.
+ *
+ * Deliberately does **not** bump `attempts`. That column counts *manual* retries
+ * (`POST /candidates/:id/retry`), because its value is what builds the fresh
+ * queue-job id; automatic attempts are BullMQ's to count, and mixing the two
+ * would produce a retry id colliding with one already used.
+ *
+ * Terminal rows are excluded, so this can never re-open a candidate that another
+ * worker already finished.
+ *
+ * @param {Queryable} db
+ * @param {string} candidateId
+ * @returns {Promise<TransitionResult>}
+ */
+export async function releaseCandidateToPending(db, candidateId) {
+  return runGuardedTransition(db, {
+    candidateId,
+    sql: `UPDATE candidates
+             SET status = 'pending',
+                 updated_at = now()
+           WHERE id = $1 AND status = ANY($2::text[])
+           RETURNING ${CANDIDATE_FULL_COLUMNS}`,
+    params: [candidateId, ['parsing', 'evaluating']],
+  });
+}

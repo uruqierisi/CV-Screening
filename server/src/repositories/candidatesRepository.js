@@ -222,9 +222,15 @@ export async function findCandidateStatusesByIds(db, candidateIds) {
 }
 
 /**
- * Prior uploads of byte-identical content for the same role. Uploads are not
- * idempotent in v1, so this makes a duplicate detectable after the fact rather
- * than preventing it - which is exactly why the supporting index is non-unique.
+ * The candidate holding byte-identical content for the same role, if there is
+ * one.
+ *
+ * Since migration 0008 there can be at most one per role: uploads are idempotent
+ * on `(role_id, content_sha256)` and a duplicate upload returns the existing
+ * candidate rather than creating a second. So this is now a lookup rather than
+ * the after-the-fact duplicate detector it was written as - the return type
+ * stays a list because the same content across DIFFERENT roles is legitimate and
+ * `excludeCandidateId` still has a job to do.
  *
  * @param {Queryable} db
  * @param {{ roleId: string, contentSha256: string, excludeCandidateId?: string }} input
@@ -266,4 +272,93 @@ export async function findStuckCandidates(db, { updatedBefore, limit }) {
     [updatedBefore, limit],
   );
   return rows.map(toCandidateListRow);
+}
+
+/**
+ * Inserts a batch of candidates, treating a byte-identical prior upload for the
+ * same role as already done.
+ *
+ * ## Why this exists beside `insertCandidates`
+ *
+ * Uploads became idempotent on `(role_id, content_sha256)` in phase 4, enforced
+ * by a UNIQUE constraint (migration 0008). This reverses the earlier decision
+ * recorded in plan sections 2, 3 and 8, and those sections were rewritten rather
+ * than left contradictory.
+ *
+ * The semantics the owner chose: a duplicate upload **returns the existing
+ * candidate** rather than erroring. Same bytes, same role, same result - no new
+ * work, no second LLM spend, and no 409 to make a double-clicked button look
+ * broken. Re-screening a candidate that failed stays the retry endpoint's job.
+ *
+ * `insertCandidates` is kept unchanged as the plain insert: it is what the test
+ * fixtures build rows with, and a fixture that silently returned somebody else's
+ * row would make a confusing test failure. This is the function the upload path
+ * uses.
+ *
+ * ## The one statement
+ *
+ * `ON CONFLICT DO NOTHING` returns nothing for the rows it skipped, and a plain
+ * `SELECT` in the same statement cannot see the rows it just inserted - one
+ * snapshot. So the result is the union of the two: what was inserted, and what
+ * already existed for the shas that were not.
+ *
+ * **Precondition:** `candidates` must be unique by `contentSha256` within the
+ * call. Two files with identical bytes in one batch are collapsed by the caller,
+ * which is also where the redundant file gets unlinked.
+ *
+ * @param {Queryable} db
+ * @param {{ roleId: string, jobId: string, candidates: CandidateInsertInput[] }} input
+ * @returns {Promise<{ candidate: Candidate, created: boolean }[]>} in the order
+ *   supplied; `created: false` means the row was already there
+ */
+export async function insertCandidatesIdempotent(db, { roleId, jobId, candidates }) {
+  if (candidates.length === 0) return [];
+
+  const payload = candidates.map((candidate, index) => ({
+    src_id: candidate.id ?? null,
+    src_original_filename: candidate.originalFilename,
+    src_storage_path: candidate.storagePath,
+    src_content_sha256: candidate.contentSha256,
+    src_mime_type: candidate.mimeType,
+    src_byte_size: candidate.byteSize,
+    ordinal: index,
+  }));
+
+  // Every input column is prefixed so that CANDIDATE_FULL_COLUMNS can be used
+  // unqualified in both branches of the union without any name colliding.
+  const { rows } = await db.query(
+    `WITH input AS (
+       SELECT * FROM jsonb_to_recordset($3::jsonb)
+         AS c(src_id uuid, src_original_filename text, src_storage_path text,
+              src_content_sha256 char(64), src_mime_type text, src_byte_size integer,
+              ordinal integer)
+     ),
+     inserted AS (
+       INSERT INTO candidates (
+         id, role_id, job_id, original_filename, storage_path, content_sha256,
+         mime_type, byte_size
+       )
+       SELECT COALESCE(i.src_id, gen_random_uuid()), $1, $2, i.src_original_filename,
+              i.src_storage_path, i.src_content_sha256, i.src_mime_type, i.src_byte_size
+         FROM input i
+        ORDER BY i.ordinal
+       ON CONFLICT (role_id, content_sha256) DO NOTHING
+       RETURNING ${CANDIDATE_FULL_COLUMNS}
+     )
+     SELECT i.ordinal, true AS created, ${CANDIDATE_FULL_COLUMNS}
+       FROM input i
+       JOIN inserted ON inserted.content_sha256 = i.src_content_sha256
+     UNION ALL
+     SELECT i.ordinal, false AS created, ${CANDIDATE_FULL_COLUMNS}
+       FROM input i
+       JOIN candidates ON candidates.role_id = $1
+                      AND candidates.content_sha256 = i.src_content_sha256
+      WHERE NOT EXISTS (
+        SELECT 1 FROM inserted WHERE inserted.content_sha256 = i.src_content_sha256
+      )
+      ORDER BY ordinal`,
+    [roleId, jobId, JSON.stringify(payload)],
+  );
+
+  return rows.map((row) => ({ candidate: toCandidate(row), created: row.created }));
 }

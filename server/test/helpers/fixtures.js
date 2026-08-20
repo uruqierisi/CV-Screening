@@ -68,7 +68,13 @@ export function candidateInput(overrides = {}) {
     // Mirrors the real storage rule: a path derived from the candidate id,
     // relative to UPLOAD_ROOT, never absolute.
     storagePath: `${id}.pdf`,
-    contentSha256: 'a'.repeat(64),
+    // Derived from the id so that every fixture candidate has DIFFERENT content
+    // by default, which is what a real batch of CVs looks like. It used to be a
+    // constant, and migration 0008's UNIQUE (role_id, content_sha256) made that
+    // constant mean "every fixture uploads the same CV twice" - a collision in
+    // any test that creates two candidates for one role. A test that wants a
+    // duplicate now has to ask for one, which is the right way round.
+    contentSha256: id.replace(/-/g, '').padEnd(64, '0'),
     mimeType: 'application/pdf',
     byteSize: 128_000,
     ...overrides,

@@ -118,7 +118,7 @@ describe('schema', () => {
       'candidates_active_status_idx',
       'candidates_job_status_idx',
       'candidates_pkey',
-      'candidates_role_content_sha256_idx',
+      'candidates_role_content_sha256_key',
       'candidates_role_fit_ranking_idx',
       'candidates_role_ranking_idx',
     ]);
@@ -135,13 +135,32 @@ describe('schema', () => {
     expect(byName.get('candidates_active_status_idx')).toContain('WHERE');
   });
 
-  it('keeps the duplicate-CV index non-unique on purpose', async () => {
+  it('enforces upload idempotency with a UNIQUE (role_id, content_sha256)', async () => {
     const { rows } = await pool.query(
-      `SELECT indexdef FROM pg_indexes WHERE indexname = 'candidates_role_content_sha256_idx'`,
+      `SELECT indexdef FROM pg_indexes WHERE indexname = 'candidates_role_content_sha256_key'`,
     );
 
-    // Uploads are not idempotent in v1: duplicates are detectable, not prevented.
-    expect(rows[0].indexdef).not.toContain('UNIQUE');
+    // Migration 0008 REVERSED the original decision here. This index was
+    // "non-unique on purpose" and duplicates were detectable rather than
+    // prevented; uploads are now idempotent on (role_id, content_sha256), and a
+    // duplicate upload returns the existing candidate instead of creating a
+    // second one. Plan sections 2, 3 and 8 were rewritten in the same change.
+    expect(rows[0].indexdef).toContain('UNIQUE');
+    expect(rows[0].indexdef).toContain('(role_id, content_sha256)');
+  });
+
+  it('backs the unique index with a named constraint, so a violation names the rule', async () => {
+    const { rows } = await pool.query(
+      `SELECT conname, contype FROM pg_constraint
+        WHERE conrelid = 'candidates'::regclass AND conname = 'candidates_role_content_sha256_key'`,
+    );
+
+    // ON CONFLICT (role_id, content_sha256) only needs a unique index to
+    // arbitrate on. The constraint is what makes the rule visible in the
+    // catalogue as a business rule rather than as a lookup that happens to be
+    // unique.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].contype).toBe('u');
   });
 
   it('indexes the one foreign key column PostgreSQL does not index for us', async () => {
