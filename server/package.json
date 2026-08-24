@@ -26,12 +26,14 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
+    "@aws-sdk/client-s3": "^3.716.0",
     "@fastify/cors": "^11.3.0",
     "@fastify/multipart": "^10.1.1",
     "@fastify/rate-limit": "^11.2.0",
     "bullmq": "^6.1.2",
     "fastify": "^5.12.1",
     "ioredis": "^6.0.0",
+    "node-pg-migrate": "^9.0.0",
     "pg": "^8.13.1",
     "pino": "^10.3.1",
     "unpdf": "^1.8.1",
@@ -40,7 +42,6 @@
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^4.1.11",
-    "node-pg-migrate": "^9.0.0",
     "vitest": "^4.1.11"
   }
 }

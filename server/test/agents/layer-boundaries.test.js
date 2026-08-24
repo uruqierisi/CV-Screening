@@ -190,15 +190,33 @@ describe('the agent layer imports nothing it should not', () => {
     //                        and the allow-headers negotiation is a spec to
     //                        re-implement, not four lines saved - and getting it
     //                        subtly wrong is a security bug rather than a bug.
+    //
+    // Phase 6 (deployment) added one and promoted one:
+    //
+    //   @aws-sdk/client-s3   the S3-compatible storage adapter. Hand-rolling
+    //                        SigV4 is ~100 lines of signing rules where a
+    //                        mistake is an opaque 403, and `aws4fetch` would
+    //                        save megabytes at the cost of implementing the
+    //                        request semantics ourselves. Confined to
+    //                        `src/storage/s3.js` and asserted below to stay
+    //                        out of both framework-agnostic layers.
+    //   node-pg-migrate      moved from devDependencies. It was always imported
+    //                        at module load by `scripts/migrate.js`, and hosting
+    //                        platforms set NODE_ENV=production, under which
+    //                        `npm install` skips devDependencies - so the
+    //                        deployed image could not migrate itself. A build
+    //                        tool that production code imports is a dependency.
     const pkg = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8'));
     expect(Object.keys(pkg.dependencies).sort()).toEqual([
       '@anthropic-ai/sdk',
+      '@aws-sdk/client-s3',
       '@fastify/cors',
       '@fastify/multipart',
       '@fastify/rate-limit',
       'bullmq',
       'fastify',
       'ioredis',
+      'node-pg-migrate',
       'pg',
       'pino',
       'unpdf',
@@ -207,13 +225,20 @@ describe('the agent layer imports nothing it should not', () => {
     ]);
   });
 
-  it('keeps every web and queue dependency out of the two framework-agnostic layers', () => {
+  it('keeps every web, queue and storage dependency out of the two framework-agnostic layers', () => {
     // The rule the plan states in section 0 and section 5: `src/agents/` imports
     // no web framework and no DB driver, and `src/extraction/` is the same shape.
-    // Six packages arrived in phase 4 and `@fastify/cors` in phase 5; not one of
-    // them may cross either line - the worker composes these layers, it does not
-    // let them learn about a queue or an Origin header.
-    const phase4 = [
+    // Six packages arrived in phase 4, `@fastify/cors` in phase 5 and
+    // `@aws-sdk/client-s3` in phase 6; not one of them may cross either line -
+    // the worker composes these layers, it does not let them learn about a
+    // queue, an Origin header or a bucket.
+    //
+    // The S3 client matters here more than the others. The agent layer takes
+    // `cvText` as a string and the extraction layer takes bytes as a Buffer;
+    // both are deliberately ignorant of where those came from, which is what
+    // lets the whole of `test/agents/**` run with no network and no disk. A
+    // storage SDK reaching either layer would end that quietly.
+    const infrastructurePackages = [
       'fastify',
       '@fastify/cors',
       '@fastify/multipart',
@@ -221,12 +246,13 @@ describe('the agent layer imports nothing it should not', () => {
       'bullmq',
       'ioredis',
       'pino',
+      '@aws-sdk/client-s3',
     ];
 
     for (const file of AGENT_FILES) {
       const imports = runtimeImports(readFileSync(file, 'utf8'));
       for (const specifier of imports) {
-        expect(phase4, `${file} imports ${specifier}`).not.toContain(specifier);
+        expect(infrastructurePackages, `${file} imports ${specifier}`).not.toContain(specifier);
       }
     }
   });
