@@ -39,7 +39,8 @@
 
 import { buildApp } from './app.js';
 import { env } from './config/env.js';
-import { closePool } from './db/pool.js';
+import { assertSchemaMigrated } from './db/assertSchema.js';
+import { closePool, pool } from './db/pool.js';
 import { closeRedis } from './queue/connection.js';
 import { closeScreeningQueue } from './queue/screeningQueue.js';
 import { closeStorage, storageDriver } from './storage/index.js';
@@ -50,6 +51,14 @@ const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'];
 
 async function main() {
   const app = await buildApp();
+
+  // Before the port opens, because `/health` cannot catch this one: its database
+  // probe is `SELECT 1`, which succeeds against a database with no tables, so an
+  // unmigrated deployment reports healthy and then fails every real request on a
+  // missing relation. Refusing to start is the visible failure; a green deploy
+  // that 500s on everything is the invisible one.
+  const schema = await assertSchemaMigrated(pool);
+  app.log.info({ ...schema }, 'schema check passed');
 
   // The deployed configuration, in one line, at boot.
   //
@@ -117,7 +126,15 @@ async function main() {
   await app.listen({ port: env.PORT, host: env.HOST });
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
   process.stderr.write(`api failed to start: ${error.message}\n`);
   process.exitCode = 1;
+
+  // Nothing is listening yet, but the schema check above opened a pooled
+  // connection and `pool.js` holds an idle client for 30 seconds. Without this
+  // the process prints the reason it cannot run and then sits there for half a
+  // minute before exiting - which on a platform that restarts a failed service
+  // is 30 dead seconds per attempt, and looks like a hang rather than a
+  // refusal.
+  await closePool().catch(() => {});
 });
