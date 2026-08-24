@@ -27,8 +27,9 @@ processes** and both must be running for a CV to be screened — steps 6 and 7 a
 not one.
 
 ```bash
-# 1. Configuration. Every value in .env.example is a working default; the only
-#    blank is the API key.
+# 1. Configuration. Every value a local run needs is a working default; the only
+#    blank that matters here is the API key. The other blanks are deployment-only
+#    (S3 credentials, the upload token) and blank is their off switch.
 cp .env.example .env
 
 # 2. Put your key in .env:  ANTHROPIC_API_KEY=sk-ant-...
@@ -413,16 +414,65 @@ Stated as they are. Several of these are the direct cost of a decision above.
   also the exact shape someone would use to game a `min_years_experience` requirement.
 
 - **No authentication.** The specification has none, so the system has none. There is no
-  principal, no tenancy and no access control on any endpoint; upload rate limiting is by IP
-  and is a cost guard, not a security control. This is not deployable on a public network as
-  it stands.
+  principal, no tenancy and no access control on any endpoint. Two things bound the damage on
+  a public URL and **neither is security**: per-IP rate limiting, and `UPLOAD_ACCESS_TOKEN` —
+  a shared secret the three money-spending endpoints require. The browser has to send that
+  token, so it is compiled into the JavaScript bundle and is readable by anyone who opens
+  devtools; it stops a crawler spending the API budget and it stops nothing else. This is not
+  deployable on a public network as it stands.
 
 - **A single worker process.** One process, `SCREENING_CONCURRENCY` candidates at a time.
-  Running a second one works — the queue provides the locking — but only if it shares a
-  filesystem with the API, which is the next item.
+  Running a second one works — the queue provides the locking. Under `STORAGE_DRIVER=local` it
+  also has to share a filesystem with the API, which is the next item; under `s3` that
+  constraint is gone and a second worker is a second process with the same environment.
 
 - **Local disk means the API and the worker must share a filesystem.** This does not scale
-  horizontally as written. The sharpest architectural limit in the system.
+  horizontally as written. The sharpest architectural limit in the system — and the one the
+  deployment had to answer first. `STORAGE_DRIVER=s3` puts an S3-compatible adapter behind the
+  same five-operation seam `storage/localDisk.js` always exposed — `writeStream`, `readStored`,
+  `storedFileExists`, `removeStored`, `renameStored` — so the two processes can be separated.
+  The local driver is unchanged and is still the development default; both are held to the same
+  contract in `test/unit/storageContract.js`. That contract runs against local disk always, and
+  against a real bucket only when S3 credentials are configured — on a fresh clone the S3
+  adapter ships untested, and the suite says so by skipping rather than passing silently.
+
+- **The deployed free tier runs the worker inside the API process.** `RUN_WORKER_IN_PROCESS`
+  selects it. `src/worker.js` is still the worker's entry point — it is what `npm run worker`
+  starts, what development runs, and what a paid deployment runs — and the flag changes only
+  *where* `startScreeningWorker()` is called, not what it does. What it costs is real: fault
+  isolation. A crash while parsing a hostile PDF now takes the HTTP API down with it, where
+  before it took down only the worker. It also means screening throughput cannot be scaled
+  without scaling the API.
+
+- **The deployed API sleeps after 15 minutes of inactivity**, and the first page load after an
+  idle period takes up to a minute. Queued work is not lost: candidates are committed to
+  Postgres before anything is enqueued and the job waits in Redis until the process wakes. The
+  UI names the wait rather than showing a bare spinner, because an unexplained fifty-second
+  spinner reads as broken software.
+
+  Because the worker now lives in that same process, a spin-down that lands mid-screening is a
+  clean shutdown: the candidate is released back to `pending` and re-queued. It costs one of
+  the two `SCREENING_JOB_ATTEMPTS` the deployment allows, so a candidate unlucky enough to be
+  caught twice fails terminally with `AGENT_TIMEOUT` rather than being screened. Requires the
+  queue to still be draining fifteen minutes after the last request, which a five-file batch at
+  concurrency 1 does not do — but it is the interaction to look at first if a candidate fails
+  for no visible reason.
+
+- **A hard kill mid-screening strands a candidate in `evaluating`.** A clean shutdown does
+  not: the drain aborts the in-flight model call, which surfaces as a retryable
+  `AGENT_TIMEOUT`, and the processor releases the candidate back to `pending` — asserted end to
+  end in `test/pipeline/drain.test.js`. `SIGKILL` skips that path, and because every status
+  transition is guarded by `WHERE status = $expected`, no future job can claim the row.
+  `npm run reconcile` is the recovery and it is manual.
+
+- **Migrations are not part of the deploy.** Nothing on the platform runs them; the schema is
+  applied by hand from a developer's machine, and a schema change is therefore two steps that
+  can be done in the wrong order. What the deployment does have is a guard rather than a hope:
+  the API checks the migration count against the migrations this build carries and refuses to
+  start if the database is empty or behind, naming the command to run. That guard exists
+  because `/health` cannot catch this — its database probe is `SELECT 1`, which succeeds
+  against a database with no tables, so without it an unmigrated deploy reports healthy and
+  then fails every request on a missing relation. See [Deploying](#deploying).
 
 - **Non-English and non-Western-format CVs** extract poorly. No adequate mitigation; it belongs
   on the risk register rather than in a mitigation column. Distinct from the two-column item:
@@ -441,6 +491,81 @@ Stated as they are. Several of these are the direct cost of a decision above.
 - **No rescore path after a role edit.** Old scores persist, stamped with the role version they
   were scored under, and the dashboard will show candidates scored against different rubrics
   side by side.
+
+---
+
+## Deploying
+
+Five pieces, and not one of them is Render's own database — every free tier here is one that
+does not expire.
+
+| Piece | Where | Why that one |
+|---|---|---|
+| The UI | Vercel | static bundle, [`web/vercel.json`](web/vercel.json) rewrites everything but `/assets/` to `index.html` so a deep link survives a refresh |
+| The API **and** the worker | Render, one web service | the free tier has no always-on background worker, so `RUN_WORKER_IN_PROCESS=true` hosts it inside the API |
+| Postgres | Neon | free tier does not expire; a Render database does |
+| Redis | Upstash | same, and metered per command — which is what `SCREENING_DRAIN_DELAY_S` exists to control |
+| The CVs | Backblaze B2 | S3-compatible, so the API and the worker stop needing a shared filesystem |
+
+[`render.yaml`](render.yaml) is the API's blueprint. It carries the topology and the cost dials
+and no secrets: everything marked `sync: false` is set once in the dashboard.
+
+### Migrate first, from your own machine
+
+Nothing on the platform runs migrations. The API refuses to start against a database that is
+empty or behind, so the order is not optional: migrate, then deploy.
+
+```sh
+cd server
+DATABASE_URL='postgresql://USER:PASSWORD@ep-example-12345678.us-east-2.aws.neon.tech/neondb?sslmode=require' \
+  npm run migrate
+```
+
+An inline `DATABASE_URL` takes precedence over the one in `.env`, so this does not touch your
+local database.
+
+**That must be Neon's direct host, not the pooled one.** The pooled endpoint is a
+transaction-mode pooler: consecutive statements from one client can land on different backend
+sessions. `node-pg-migrate` opens its run by taking a **session-level advisory lock** to stop
+two migrators racing, and a session-level lock taken on a session you do not keep is not a lock
+you still hold — so through the pooler the guarantee quietly evaporates while every statement
+still appears to succeed. There is no error to read; that is exactly why it is worth a
+paragraph. In Neon's dashboard the pooled connection string is the one whose hostname contains
+`-pooler`; the direct host is the same name without it. Use the pooled host for `DATABASE_URL`
+on Render, where many short-lived connections are the point, and the direct host only for this
+command.
+
+### The values that have to match
+
+| On Render | On Vercel | Must be |
+|---|---|---|
+| `UPLOAD_ACCESS_TOKEN` | `VITE_UPLOAD_TOKEN` | byte-identical, or every upload and retry answers 403 |
+| `CORS_ALLOWED_ORIGINS` | — | the Vercel origin, bare: scheme, host, optional port, no path, no trailing slash |
+| — | `VITE_API_BASE_URL` | the Render origin, bare — without it the browser asks Vercel for `/api/v1/config` and gets its 404 page |
+
+A CORS mismatch is invisible server-side: `@fastify/cors` simply omits the header and the
+request logs as an ordinary 200, so the failure exists only in the browser console. That is why
+`server.js` prints the allowlist it actually parsed at boot, next to the storage driver and the
+worker mode.
+
+### Check the bucket before trusting it
+
+The S3 adapter's contract suite skips when no credentials are configured, so on a fresh clone
+it asserts nothing. Point it at the real bucket once:
+
+```sh
+cd server
+STORAGE_DRIVER=s3 \
+S3_BUCKET=your-bucket S3_ENDPOINT=https://s3.us-west-004.backblazeb2.com \
+S3_REGION=us-west-004 S3_ACCESS_KEY_ID=... S3_SECRET_ACCESS_KEY=... \
+  npx vitest run --project unit test/unit/storage.s3.test.js
+```
+
+It runs the same contract local disk is held to — PUT, GET, HEAD, DELETE and both shapes of
+404 — against the real thing, which is the check that the bucket, the endpoint, the region and
+the key permissions are all actually right. It writes under fresh UUIDs and deletes what it
+wrote, so it is safe against the deployment's own bucket, and it costs a handful of
+transactions well inside B2's free daily allowance.
 
 ---
 
@@ -495,9 +620,43 @@ the pair worth uploading together is `clean.pdf` and `demonstrated-evidence.txt`
 
 ### Configuration
 
-[`.env.example`](.env.example) documents every variable the system reads, with the reasoning
-for the non-obvious ones. Every value in it is a working default; the only blank is
-`ANTHROPIC_API_KEY`.
+[`.env.example`](.env.example) documents every variable the server reads, with the reasoning
+for the non-obvious ones. Every variable a local run needs carries a working default. Six are
+blank, and only one of them matters on a laptop: `ANTHROPIC_API_KEY`. The other five —
+`S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and
+`UPLOAD_ACCESS_TOKEN` — are deployment-only, and blank is their off switch: the storage
+credentials are required only when `STORAGE_DRIVER=s3`, and an absent upload token means the
+guard allows everything. [`web/.env.example`](web/.env.example) does the same for the two the
+browser client reads, neither of which is needed to run locally.
+
+Four switches turn the deployment on, and each is off or local by default so that nothing
+about running this on a laptop changed. The `S3_*` credentials sit behind the first of them —
+required only when the driver is `s3`, ignored otherwise — and `DEPENDENCY_CHECK_TIMEOUT_MS`
+bounds the two `/health` probes everywhere, not only when deployed:
+
+| Variable | Default | What it turns on |
+|---|---|---|
+| `STORAGE_DRIVER` | `local` | `s3` stores CVs in an S3-compatible bucket instead of on local disk, so the API and the worker no longer need a shared filesystem |
+| `RUN_WORKER_IN_PROCESS` | `false` | `true` hosts the screening worker inside the API process, for hosts that offer one always-on process |
+| `UPLOAD_ACCESS_TOKEN` | empty (off) | a shared secret on the three endpoints that spend API credit |
+| `SCREENING_DRAIN_DELAY_S` | `5` | how long the worker blocks on an empty queue; a cost control on a metered Redis |
+
+#### `UPLOAD_ACCESS_TOKEN` is a speed bump, not security
+
+Said plainly, because the shape of it invites the opposite reading. When the variable is set,
+the two upload endpoints and `POST /candidates/:id/retry` require an `x-upload-token` header.
+Retry is in that list because it re-runs both model calls from scratch and therefore costs
+exactly what an upload costs — it is the endpoint most easily forgotten.
+
+The browser has to send that header, so the value is supplied to the frontend build as
+`VITE_UPLOAD_TOKEN`, and **Vite inlines `VITE_`-prefixed variables into the JavaScript bundle
+at build time**. It is not hidden, not hashed and not obfuscated: `grep` the deployed bundle
+and it is there in plain text. Anyone who opens devtools has it.
+
+What it is actually for: this deployment runs on an API key with a real balance, and the URL
+is public. The token means a crawler or a passer-by who finds the URL cannot spend that
+balance. It establishes no principal, protects no data, and would stop nobody who wanted in.
+Anything that needed real protection would need a login, which this system does not have.
 
 ### The seed
 
@@ -525,9 +684,14 @@ candidates are stamped with.
 | `server/` | `npm run dev` / `dev:worker` | the same two, with `--watch` |
 | `server/` | `npm run migrate` / `migrate:down` | schema up / down |
 | `server/` | `npm run seed` | the two example roles |
-| `server/` | `npm test` | 1320 tests; needs Docker running |
-| `server/` | `npm run test:unit` | 1020 of those, in ~4s, with **Docker stopped** |
+| `server/` | `npm test` | 1369 tests; needs Docker running |
+| `server/` | `npm run test:unit` | 1053 of those, in ~5s, with **Docker stopped** |
 | `server/` | `npm run reconcile` | re-enqueue candidates stranded by a crash |
 | `web/` | `npm run dev` | the UI on :5173 |
-| `web/` | `npm test` | 126 tests |
+| `web/` | `npm test` | 138 tests |
 | `web/` | `npm run build` | production bundle |
+
+Both server figures assume S3 credentials in `.env`, which lets the storage contract run
+against a real bucket. Without them that file skips and the counts are 1359 and 1043 — the ten
+missing tests are the S3 adapter's, and skipping is the honest answer rather than passing
+without a bucket.
