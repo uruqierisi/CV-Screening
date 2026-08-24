@@ -18,6 +18,7 @@ import {
   postCandidateRetry,
 } from '../controllers/candidatesController.js';
 import { getConfig, getHealth } from '../controllers/metaController.js';
+import { uploadTokenHook } from '../http/uploadGuard.js';
 import { getJob } from '../controllers/jobsController.js';
 import {
   deleteRole,
@@ -45,16 +46,22 @@ export async function registerRoutes(app) {
   app.put('/roles/:roleId', putRole);
   app.delete('/roles/:roleId', deleteRole);
 
-  // The two endpoints that spend real API money, and therefore the only two
-  // that are rate limited (plan section 3). With no auth the only principal is
-  // the client IP, which bounds how much this buys - it is a cost guard, not a
-  // security control, and the README says so.
+  // The endpoints that spend real API money, and therefore the only ones that
+  // are rate limited (plan section 3) and the only ones behind the shared-secret
+  // guard. With no auth the only principal is the client IP, which bounds how
+  // much the rate limit buys - both of these are cost guards, not security
+  // controls, and the README says so in those words.
   //
-  // Scoped inside a plugin rather than applied globally: rate-limiting a
-  // dashboard that polls every 3 seconds would break the product to protect
-  // nothing.
-  await app.register(async (uploads) => {
-    await uploads.register(import('@fastify/rate-limit'), {
+  // Scoped inside a plugin rather than applied globally: rate-limiting or
+  // gating a dashboard that polls every 3 seconds would break the product to
+  // protect nothing.
+  //
+  // **Three routes, not two.** `POST /candidates/:id/retry` re-runs both model
+  // calls from scratch, so it costs exactly what an upload costs. It lives here
+  // for that reason alone - it is not an upload, and it was the endpoint most
+  // easily forgotten when this scope was two routes wide.
+  await app.register(async (spending) => {
+    await spending.register(import('@fastify/rate-limit'), {
       max: env.UPLOAD_RATE_LIMIT_MAX,
       timeWindow: env.UPLOAD_RATE_LIMIT_WINDOW_MS,
       // In-process counters. A second API instance would count separately; that
@@ -64,8 +71,15 @@ export async function registerRoutes(app) {
       addHeadersOnExceeding: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true },
     });
 
-    uploads.post('/roles/:roleId/candidates', postCandidate);
-    uploads.post('/roles/:roleId/candidates/batch', postCandidateBatch);
+    // Registered unconditionally; the hook itself is a no-op when
+    // `UPLOAD_ACCESS_TOKEN` is unset, which is how development and the test
+    // suite stay untouched. `onRequest` so a request with no token is refused
+    // before a 5 MB multipart body is streamed anywhere.
+    spending.addHook('onRequest', uploadTokenHook);
+
+    spending.post('/roles/:roleId/candidates', postCandidate);
+    spending.post('/roles/:roleId/candidates/batch', postCandidateBatch);
+    spending.post('/candidates/:candidateId/retry', postCandidateRetry);
   });
 
   app.get('/jobs/:jobId', getJob);
@@ -77,5 +91,4 @@ export async function registerRoutes(app) {
   // that fails a uuid check, and the poll returns 400 for no visible reason.
   app.get('/candidates/statuses', getCandidateStatusesHandler);
   app.get('/candidates/:candidateId', getCandidateById);
-  app.post('/candidates/:candidateId/retry', postCandidateRetry);
 }

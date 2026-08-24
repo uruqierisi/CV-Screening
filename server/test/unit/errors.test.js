@@ -51,9 +51,26 @@ describe('the code-to-status table', () => {
     expect(ERROR_STATUS_BY_CODE[code]).toBe(status);
   });
 
-  it('carries nothing beyond the plan table except the unrouted-path code', () => {
+  it('carries nothing beyond the plan table except the two codes with a stated reason', () => {
+    // The table is deliberately closed, so an addition has to be argued for here
+    // rather than merely appended in `codes.js`.
+    //
+    //   NOT_FOUND             an unrouted path. Fastify's own 404 has to become
+    //                         the same envelope as everything else, and
+    //                         inventing ROLE_NOT_FOUND for `/api/v1/nonsense`
+    //                         would be a lie about which resource was missing.
+    //
+    //   UPLOAD_TOKEN_INVALID  phase 6's shared secret on the three endpoints
+    //                         that spend API money. Not in plan section 3
+    //                         because the plan assumed a private deployment;
+    //                         a public URL with a funded API key needs a cost
+    //                         guard the rate limit alone does not give. 403
+    //                         rather than 401 - there is no authentication
+    //                         scheme here and no principal to authenticate.
+    const documentedAdditions = [ROUTE_NOT_FOUND_CODE, 'UPLOAD_TOKEN_INVALID'];
+
     const extra = Object.keys(ERROR_STATUS_BY_CODE).filter((code) => !(code in PLAN_TABLE));
-    expect(extra).toEqual([ROUTE_NOT_FOUND_CODE]);
+    expect(extra.sort()).toEqual([...documentedAdditions].sort());
   });
 
   it('derives ERROR_CODES from the table so the two cannot drift', () => {

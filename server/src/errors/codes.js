@@ -36,6 +36,16 @@ export const ERROR_STATUS_BY_CODE = Object.freeze({
   JOB_NOT_FOUND: 404,
   NOT_FOUND: 404,
 
+  /**
+   * The shared secret on the money-spending endpoints was absent or wrong.
+   *
+   * 403 rather than 401, deliberately: 401 advertises an authentication scheme
+   * and obliges a `WWW-Authenticate` header, and there is no scheme here and no
+   * principal to authenticate. This is a cost guard refusing a request, which is
+   * what 403 means. See `http/uploadGuard.js`.
+   */
+  UPLOAD_TOKEN_INVALID: 403,
+
   ROLE_ARCHIVED: 409,
   ROLE_NOT_SCOREABLE: 409,
   CANDIDATE_NOT_RETRYABLE: 409,
