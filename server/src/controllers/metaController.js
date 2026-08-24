@@ -36,7 +36,7 @@ import {
 } from '../schemas/candidate.schemas.js';
 import { JOB_STATUSES } from '../services/jobStatus.js';
 import { pool } from '../db/pool.js';
-import { redisReachable } from '../queue/connection.js';
+import { redisReachable, withTimeout } from '../queue/connection.js';
 
 /**
  * A rule type, described well enough for a form to render it without hard-coding
@@ -164,14 +164,20 @@ export async function getHealth(request, reply) {
  * @returns {Promise<boolean>}
  */
 async function databaseReachable(request) {
-  try {
-    await pool.query('SELECT 1');
-    return true;
-  } catch (error) {
-    // Logged rather than returned: the reason a database is unreachable is a
-    // connection string and a hostname, and neither belongs in a public
-    // liveness response.
-    request.log.error({ err: error }, 'database health check failed');
-    return false;
-  }
+  // Bounded by the same budget as the Redis probe. `pg` has its own
+  // `connectionTimeoutMillis`, but that covers establishing a socket and not a
+  // socket that connects and then goes quiet - which is what a paused or
+  // scale-to-zero hosted Postgres looks like from here.
+  return withTimeout(async () => {
+    try {
+      await pool.query('SELECT 1');
+      return true;
+    } catch (error) {
+      // Logged rather than returned: the reason a database is unreachable is a
+      // connection string and a hostname, and neither belongs in a public
+      // liveness response.
+      request.log.error({ err: error }, 'database health check failed');
+      return false;
+    }
+  }, env.DEPENDENCY_CHECK_TIMEOUT_MS);
 }

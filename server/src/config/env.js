@@ -49,6 +49,33 @@ const httpOrigin = z.string().refine(
   },
 );
 
+/**
+ * A boolean from an environment variable, which is always a string.
+ *
+ * `z.coerce.boolean()` is the wrong tool and the reason is worth stating: it
+ * applies JavaScript truthiness, so the string `'false'` coerces to `true`. A
+ * deployment that sets `RUN_WORKER_IN_PROCESS=false` to turn the worker off
+ * would turn it on. This accepts the spellings an operator actually types and
+ * rejects everything else by name.
+ */
+const envBoolean = (/** @type {boolean} */ fallback) =>
+  z
+    .enum(['true', 'false', '1', '0', 'yes', 'no'])
+    .default(fallback ? 'true' : 'false')
+    .transform((value) => value === 'true' || value === '1' || value === 'yes');
+
+/**
+ * An optional secret or credential. Blank is the same as absent, because
+ * `.env.example` ships these lines empty and an empty string is not a value.
+ */
+const optionalSecret = z
+  .string()
+  .optional()
+  .transform((value) => {
+    const trimmed = value === undefined ? '' : value.trim();
+    return trimmed === '' ? undefined : trimmed;
+  });
+
 const baseEnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   DATABASE_URL: postgresUrl,
@@ -150,6 +177,29 @@ const baseEnvSchema = z.object({
     }),
 
   /**
+   * **How long the worker blocks on an empty queue**, seconds. BullMQ's
+   * `drainDelay`, surfaced as a dial because on a metered Redis it is a cost
+   * control rather than a tuning knob.
+   *
+   * Measured against `bullmq@6.1.2` and a real Redis (`INFO commandstats`, empty
+   * queue, concurrency 1): at the library default of 5 the worker issues roughly
+   * **96-106 commands per minute** while doing nothing at all. That is not one
+   * blocking pop - each idle cycle is a `bzpopmin`, an `evalsha`, the six inner
+   * commands Redis counts for that script, and a connection `ping`.
+   *
+   * At ~6,000 commands per awake hour, Upstash's free tier of 500,000 per month
+   * is 79-87 awake-hours - and an always-on worker would spend it nine times
+   * over. Raising this divides the idle cycle proportionally and costs nothing
+   * in latency, because a job added while the worker is blocked wakes the
+   * `bzpopmin` immediately rather than waiting out the timeout. Both halves of
+   * that claim are measured in `test/queue/idleCost.test.js`.
+   *
+   * The default stays at BullMQ's 5 so development behaves exactly as it always
+   * has; the deployment raises it.
+   */
+  SCREENING_DRAIN_DELAY_S: z.coerce.number().int().min(1).max(300).default(5),
+
+  /**
    * Attempts per candidate, BullMQ-side, and the backoff between them. This is
    * the transient-failure budget for the *queue* layer; the agent layer has its
    * own single semantic retry inside one attempt (plan section 5.4), and the two
@@ -219,9 +269,124 @@ const baseEnvSchema = z.object({
         .filter((origin) => origin.length > 0),
     )
     .pipe(z.array(httpOrigin).min(1)),
+
+  /* ------------------------------------------------ phase 6: deployment */
+
+  /**
+   * **Which storage backend is in use**, read by `storage/index.js` and by
+   * nothing else.
+   *
+   * `local` is the development default and keeps every existing behaviour
+   * exactly as it was. `s3` is what a deployment sets when the API and the
+   * worker do not share a filesystem - which is every deployment that runs them
+   * as two processes, and also every free-tier host that wipes the disk on
+   * restart. The relative path stored in `candidates.storage_path` is the same
+   * string under both, so the switch needs no data migration.
+   */
+  STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
+
+  /**
+   * The S3-compatible bucket, endpoint, region and credentials. Optional here
+   * and **required by the superRefine below when `STORAGE_DRIVER=s3`** - so a
+   * machine with no bucket runs migrations, the seed and the whole unit suite
+   * exactly as before, and a deployment that selects `s3` without credentials
+   * fails at startup naming the variable rather than on a recruiter's upload.
+   *
+   * `S3_ENDPOINT` is what makes this provider-agnostic: Backblaze B2 is
+   * `https://s3.<region>.backblazeb2.com`, Cloudflare R2 is
+   * `https://<account>.r2.cloudflarestorage.com`, and AWS is the one that can
+   * be omitted.
+   */
+  S3_BUCKET: optionalSecret,
+  S3_ENDPOINT: optionalSecret,
+  S3_REGION: z.string().min(1).default('us-east-1'),
+  S3_ACCESS_KEY_ID: optionalSecret,
+  S3_SECRET_ACCESS_KEY: optionalSecret,
+  /** See the note in `storage/s3.js`; true works on B2 and R2, false is AWS. */
+  S3_FORCE_PATH_STYLE: envBoolean(true),
+
+  /**
+   * **Runs the screening worker inside the API process.**
+   *
+   * Off by default, which is the honest default: `src/worker.js` is the
+   * worker's entry point, it is what `npm run worker` starts, and it is what a
+   * deployment with two processes runs. This flag exists because free hosting
+   * tiers do not offer a second always-on process, and one process that screens
+   * is worth more than two that do not exist.
+   *
+   * It is a **deployment toggle, not a second implementation**: `server.js`
+   * calls the same exported `buildScreeningWorker()` that `worker.js` does, with
+   * the same concurrency, the same lock duration and the same drain. Nothing
+   * about the queue, the processor or the agent layer knows which mode it is in.
+   *
+   * What it costs is fault isolation, and that is recorded in the README rather
+   * than hidden: a crash while parsing a PDF now takes the HTTP API down with
+   * it, where before it took down only the worker.
+   */
+  RUN_WORKER_IN_PROCESS: envBoolean(false),
+
+  /**
+   * **The shared secret the two upload endpoints and the retry endpoint check.**
+   *
+   * Absent means the guard is off, which is what keeps local development and the
+   * entire test suite untouched. Present means every request to a
+   * money-spending endpoint must carry it in `x-upload-token`.
+   *
+   * This is **not authentication and the README says so in those words**. The
+   * frontend has to send it, so it is a build-time value in the client bundle
+   * and visible to anyone who opens devtools. It exists to stop a crawler or a
+   * passer-by spending the API budget on a public URL - a speed bump, sitting
+   * alongside the per-IP rate limit, not an access control.
+   */
+  UPLOAD_ACCESS_TOKEN: optionalSecret,
+
+  /**
+   * How long `/health` waits for a dependency before calling it unreachable.
+   *
+   * There has to be a bound, and the reason is specific rather than defensive:
+   * the Redis connection is built with `enableOfflineQueue: true`, so a command
+   * issued while disconnected is *buffered* rather than rejected, and the ping
+   * never settles. Without this, a health check against a dead Redis hangs
+   * instead of answering 503 - and a health check that hangs is one a load
+   * balancer cannot act on, which is the failure the endpoint exists to prevent.
+   *
+   * Two seconds: longer than a healthy round trip to a hosted Postgres or Redis
+   * by an order of magnitude, and shorter than any platform's health-check
+   * timeout.
+   */
+  DEPENDENCY_CHECK_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(2000),
 });
 
+/**
+ * The four variables the S3 driver cannot work without. `S3_REGION` is absent
+ * from this list because it carries a default that B2 and R2 both tolerate.
+ *
+ * @type {readonly ['S3_BUCKET', 'S3_ENDPOINT', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY']}
+ */
+const REQUIRED_S3_KEYS = Object.freeze([
+  'S3_BUCKET',
+  'S3_ENDPOINT',
+  'S3_ACCESS_KEY_ID',
+  'S3_SECRET_ACCESS_KEY',
+]);
+
 const envSchema = baseEnvSchema.superRefine((value, ctx) => {
+  // Checked here rather than inside `storage/s3.js`, so that a deployment which
+  // selects the S3 driver without credentials dies at startup naming the
+  // variable - instead of accepting an upload, writing it to staging, and
+  // failing on the PUT with the recruiter watching.
+  if (value.STORAGE_DRIVER === 's3') {
+    for (const key of REQUIRED_S3_KEYS) {
+      if (!value[key]) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: 'is required when STORAGE_DRIVER=s3',
+        });
+      }
+    }
+  }
+
   if (value.NODE_ENV !== 'test') return;
 
   if (!value.TEST_DATABASE_URL) {

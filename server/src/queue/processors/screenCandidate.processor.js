@@ -59,7 +59,7 @@ import {
 import { listCriteriaByRoleId } from '../../repositories/roleCriteriaRepository.js';
 import { listEliminationRulesByRoleId } from '../../repositories/roleEliminationRulesRepository.js';
 import { findRoleById } from '../../repositories/rolesRepository.js';
-import { readStored } from '../../storage/localDisk.js';
+import { readStored } from '../../storage/index.js';
 import { toAgentLogger } from '../../util/logging.js';
 import { screeningJobPayloadSchema } from '../screeningQueue.js';
 import { SOURCE_FILE_MISSING_CODE, toCandidateFailure } from '../candidateFailure.js';

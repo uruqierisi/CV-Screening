@@ -87,6 +87,23 @@ export default defineConfig({
           fileParallelism: false,
           env: {
             NODE_ENV: 'test',
+            // The suite stores locally, whatever the developer's `.env` says.
+            //
+            // This is the upload-root problem one layer out. Once
+            // `STORAGE_DRIVER=s3` is set for a deployment - and it is set in the
+            // same `.env` the suite loads - every upload case in `api/` would
+            // `PutObject` into the deployment's real bucket and leave it there,
+            // because nothing in this suite deletes an object it did not know it
+            // created. The driver is forced here for the same reason the upload
+            // root is: a test run must not write into a resource somebody else
+            // owns.
+            //
+            // This does not leave the S3 adapter untested. It has its own run of
+            // the storage contract in `test/unit/storage.s3.test.js`, against a
+            // real bucket, opt-in by the presence of credentials - which is a
+            // stronger check than routing an unrelated upload test through it
+            // by accident.
+            STORAGE_DRIVER: 'local',
             // The suite gets its own upload root, and owns it.
             //
             // Until now it shared `./uploads` with development, and three tests

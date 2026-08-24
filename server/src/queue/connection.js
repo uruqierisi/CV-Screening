@@ -59,17 +59,61 @@ export async function closeRedis() {
 /**
  * Liveness for `GET /health`.
  *
- * Deliberately opens nothing new when nothing is open: health is a report on the
- * process as it is, and a check that establishes the connection it is checking
- * would report success on a system nobody had used yet.
+ * **It must be bounded, and that is not a defensive nicety.** The connection
+ * above is built with `enableOfflineQueue: true`, which means a command issued
+ * while ioredis is disconnected is *buffered* rather than rejected - the client
+ * holds it and keeps retrying the connection. So a `ping()` against an
+ * unreachable Redis never settles: it does not throw, it does not resolve, and
+ * the `catch` below is unreachable. Without the timeout, `/health` hangs instead
+ * of answering 503, and a health check that hangs is one no load balancer and no
+ * operator can act on - which is precisely the failure the endpoint exists to
+ * prevent.
  *
+ * The timeout is the whole fix. It converts "we cannot tell" into "not
+ * reachable", which is the only answer a caller has a use for.
+ *
+ * Note that this **does** open the connection if none is open yet - it calls
+ * `redisConnection()`, which is lazy. An earlier version of this comment claimed
+ * otherwise; the code was always this way and the comment was wrong. Opening it
+ * is the correct behaviour for a health check: a process that has not yet talked
+ * to Redis has not yet proven it can, and reporting `true` on that basis would
+ * be reporting on a connection nobody has tested.
+ *
+ * @param {number} [timeoutMs] defaults to `DEPENDENCY_CHECK_TIMEOUT_MS`
  * @returns {Promise<boolean>}
  */
-export async function redisReachable() {
+export async function redisReachable(timeoutMs = env.DEPENDENCY_CHECK_TIMEOUT_MS) {
+  return withTimeout(async () => (await redisConnection().ping()) === 'PONG', timeoutMs);
+}
+
+/**
+ * Runs a probe, answering `false` if it throws or outruns the budget.
+ *
+ * Exported because `/health`'s database probe needs exactly the same bound for a
+ * different reason - `pg` has its own `connectionTimeoutMillis`, but a socket
+ * that connects and then goes quiet is not covered by it - and two health probes
+ * with two different notions of "too long" is how one of them ends up unbounded.
+ *
+ * The timer is `unref`'d so a fast probe leaves nothing holding the event loop
+ * open, and cleared so a slow one leaves nothing behind either.
+ *
+ * @param {() => Promise<boolean>} probe
+ * @param {number} timeoutMs
+ * @returns {Promise<boolean>}
+ */
+export async function withTimeout(probe, timeoutMs) {
+  /** @type {NodeJS.Timeout | undefined} */
+  let timer;
+
   try {
-    const result = await redisConnection().ping();
-    return result === 'PONG';
-  } catch {
-    return false;
+    return await Promise.race([
+      probe().catch(() => false),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }

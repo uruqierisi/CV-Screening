@@ -54,7 +54,7 @@ import {
   removeStored,
   renameStored,
   writeStream,
-} from '../storage/localDisk.js';
+} from '../storage/index.js';
 import { enqueueCandidates } from '../queue/screeningQueue.js';
 import { assertRoleAcceptsUploads } from './rolesService.js';
 

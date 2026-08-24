@@ -1,20 +1,19 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { createHash } from 'node:crypto';
 import { afterAll, describe, expect, it } from 'vitest';
+import * as localDisk from '../../src/storage/localDisk.js';
 import {
   absolutePathFor,
   allocate,
-  readStored,
   removeStored,
-  renameStored,
   storagePathFor,
   storedFileExists,
   uploadRoot,
   writeStream,
 } from '../../src/storage/localDisk.js';
+import { describeStorageContract } from './storageContract.js';
 
 /**
  * Local disk storage.
@@ -25,8 +24,14 @@ import {
  * derived from a UUID this process generated and an extension chosen from the
  * sniffed type.
  *
- * The rest is ordinary file handling, tested against the real `UPLOAD_ROOT`
- * under ids nothing else uses, and cleaned up afterwards.
+ * What is left in this file is what is genuinely local: the path rule, the
+ * allocator and the upload root. They are pure, and both drivers share the exact
+ * same implementation of them, so there is nothing to parameterise.
+ *
+ * The behavioural assertions moved to `storageContract.js` when the S3 adapter
+ * arrived, and are run from the bottom of this file. They are not weaker for
+ * having moved - they are the same assertions, now held to by two adapters
+ * instead of one.
  */
 
 /** Every path this file writes, so the cleanup is exact rather than a wipe. */
@@ -80,84 +85,10 @@ describe('storagePathFor', () => {
   });
 });
 
-describe('writeStream', () => {
-  it('writes the bytes and hashes them in the same pass', async () => {
-    const bytes = Buffer.from('Jane Doe\nSenior Backend Engineer\n', 'utf8');
-    const { relativePath } = allocateTracked('.txt');
 
-    const result = await writeStream({ source: Readable.from(bytes), relativePath });
 
-    expect(result.byteSize).toBe(bytes.length);
-    expect(result.contentSha256).toBe(createHash('sha256').update(bytes).digest('hex'));
-    expect(await readStored(relativePath)).toEqual(bytes);
-  });
 
-  it('creates the fan-out directories it needs', async () => {
-    const { relativePath } = allocateTracked('.txt');
-    await writeStream({ source: Readable.from(Buffer.from('x')), relativePath });
-    expect(await storedFileExists(relativePath)).toBe(true);
-  });
 
-  it('hashes an empty file rather than failing on it', async () => {
-    // An empty upload is refused as UNSUPPORTED_FILE_TYPE by the sniffer, which
-    // runs after this. Storage should not have its own opinion about it.
-    const { relativePath } = allocateTracked('.txt');
-    const result = await writeStream({ source: Readable.from([]), relativePath });
-    expect(result.byteSize).toBe(0);
-    expect(result.contentSha256).toBe(createHash('sha256').update(Buffer.alloc(0)).digest('hex'));
-  });
-});
-
-describe('renameStored', () => {
-  it('moves a file to the extension the sniffer chose', async () => {
-    const { relativePath } = allocateTracked('.upload');
-    await writeStream({ source: Readable.from(Buffer.from('%PDF-1.4')), relativePath });
-
-    const finalPath = relativePath.replace(/\.upload$/, '.pdf');
-    written.push(finalPath);
-
-    expect(await renameStored(relativePath, finalPath)).toBe(finalPath);
-    expect(await storedFileExists(relativePath)).toBe(false);
-    expect(await storedFileExists(finalPath)).toBe(true);
-  });
-});
-
-describe('storedFileExists', () => {
-  it('is false for a path that was never written', async () => {
-    expect(await storedFileExists('zz/zz/nothing-here.pdf')).toBe(false);
-  });
-
-  it('is false for a directory', async () => {
-    // `stat` succeeds on a directory; a directory is not a CV.
-    const { relativePath } = allocateTracked('.txt');
-    await writeStream({ source: Readable.from(Buffer.from('x')), relativePath });
-    expect(await storedFileExists(path.dirname(relativePath))).toBe(false);
-  });
-});
-
-describe('removeStored', () => {
-  it('deletes a file and reports success', async () => {
-    const { relativePath } = allocateTracked('.txt');
-    await writeStream({ source: Readable.from(Buffer.from('x')), relativePath });
-
-    expect(await removeStored(relativePath)).toBe(true);
-    expect(await storedFileExists(relativePath)).toBe(false);
-  });
-
-  it('is a no-op on a file that is already gone', async () => {
-    // Both callers have already decided the file is not wanted; an orphan is
-    // harmless, and a throw here would turn a successful upload into a failure.
-    expect(await removeStored('zz/zz/never-existed.pdf')).toBe(true);
-  });
-});
-
-describe('readStored', () => {
-  it('throws ENOENT for a missing file, so the caller can decide what that means', async () => {
-    // A 410 at the retry endpoint and a candidate failure in the worker are
-    // different answers to the same fact, so this layer does not choose.
-    await expect(readStored('zz/zz/missing.pdf')).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-});
 
 describe('allocate', () => {
   it('returns a fresh id and the path derived from it', () => {
@@ -180,3 +111,8 @@ describe('the upload root', () => {
     await rm(scratch, { recursive: true, force: true });
   });
 });
+
+// The behavioural half, from the shared contract. Every assertion in there also
+// runs against the S3 adapter in `storage.s3.test.js`, which is what makes
+// "the callers cannot tell the two apart" a tested claim rather than a hope.
+describeStorageContract('local disk', localDisk, { allocate });

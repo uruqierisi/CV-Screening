@@ -16,7 +16,7 @@ import {
   listRankedCandidates,
 } from '../repositories/candidatesRepository.js';
 import { resetCandidateForRetry } from '../repositories/candidateStatusRepository.js';
-import { storedFileExists } from '../storage/localDisk.js';
+import { storedFileExists } from '../storage/index.js';
 import { enqueueCandidate } from '../queue/screeningQueue.js';
 
 /**
