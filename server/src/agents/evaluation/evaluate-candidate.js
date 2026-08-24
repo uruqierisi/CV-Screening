@@ -36,6 +36,7 @@ import { evaluationPrompt, EVALUATION_PROMPT_VERSION } from '../prompts/evaluati
 import { callStructured } from '../client/call-structured.js';
 import { NOOP_LOGGER } from '../util/logger.js';
 import { redactIdentity } from './redact-identity.js';
+import { normalizeEvaluation } from './normalize-ratings.js';
 
 export const EVALUATION_STAGE = 'evaluation';
 
@@ -141,7 +142,11 @@ export async function evaluateCandidate({
   });
 
   return {
-    evaluation: data,
+    // Cleaned before it leaves this function, so nothing downstream has to know
+    // that a quote copied out of the profile JSON can carry the JSON with it.
+    // `scoring/` puts `evidence` straight into `evaluation_matrix`, which is
+    // what the matrix screen renders.
+    evaluation: normalizeEvaluation(data),
     diagnostics: {
       promptVersion: EVALUATION_PROMPT_VERSION,
       attempts,
