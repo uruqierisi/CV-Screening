@@ -684,14 +684,14 @@ candidates are stamped with.
 | `server/` | `npm run dev` / `dev:worker` | the same two, with `--watch` |
 | `server/` | `npm run migrate` / `migrate:down` | schema up / down |
 | `server/` | `npm run seed` | the two example roles |
-| `server/` | `npm test` | 1369 tests; needs Docker running |
-| `server/` | `npm run test:unit` | 1053 of those, in ~5s, with **Docker stopped** |
+| `server/` | `npm test` | 1398 tests; needs Docker running |
+| `server/` | `npm run test:unit` | 1076 of those, in ~6s, with **Docker stopped** |
 | `server/` | `npm run reconcile` | re-enqueue candidates stranded by a crash |
 | `web/` | `npm run dev` | the UI on :5173 |
 | `web/` | `npm test` | 138 tests |
 | `web/` | `npm run build` | production bundle |
 
 Both server figures assume S3 credentials in `.env`, which lets the storage contract run
-against a real bucket. Without them that file skips and the counts are 1359 and 1043 — the ten
+against a real bucket. Without them that file skips and the counts are 1388 and 1066 — the ten
 missing tests are the S3 adapter's, and skipping is the honest answer rather than passing
 without a bucket.
