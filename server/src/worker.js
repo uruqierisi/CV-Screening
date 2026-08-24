@@ -5,6 +5,19 @@
  * HTTP request, so the request records intent and returns, and this process does
  * the work. Everything about this file follows from that split.
  *
+ * ## This is still the worker's entry point
+ *
+ * `RUN_WORKER_IN_PROCESS` lets `server.js` host the worker inside the API
+ * process, because free hosting tiers do not offer a second always-on process.
+ * That flag changes **where** {@link startScreeningWorker} is called and nothing
+ * else: the same builder, the same concurrency, the same lock duration, the same
+ * drain. `npm run worker` runs this file, development runs this file, and any
+ * deployment with two processes runs this file.
+ *
+ * The composition is deliberately one-directional - `server.js` imports from
+ * here, never the reverse - so the standalone worker never acquires a dependency
+ * on the HTTP layer in order to support the co-located mode.
+ *
  * ## The concurrency dial
  *
  * `SCREENING_CONCURRENCY` is the number below, and it is the single value that
@@ -27,9 +40,10 @@
  *
  * On a signal the worker stops taking new jobs and lets the in-flight ones
  * finish, aborting the model calls through a shared signal if they outlast the
- * grace period. A candidate cut short mid-screening is released back to
- * `pending` by the processor's ordinary retryable path, so nothing is stranded
- * by a deploy.
+ * grace period. A candidate cut short mid-screening surfaces as a retryable
+ * `AGENT_TIMEOUT`, which the processor's ordinary failure path releases back to
+ * `pending` - so a deploy stalls a screening rather than stranding it. That
+ * release is the load-bearing part of the drain and it has its own test.
  */
 
 import { pathToFileURL } from 'node:url';
@@ -41,6 +55,7 @@ import { closePool, pool } from './db/pool.js';
 import { closeRedis, redisConnection } from './queue/connection.js';
 import { makeScreeningProcessor } from './queue/processors/screenCandidate.processor.js';
 import { SCREENING_QUEUE_NAME } from './queue/screeningQueue.js';
+import { closeStorage } from './storage/index.js';
 import { REDACTED_LOG_PATHS } from './util/logging.js';
 
 /**
@@ -88,6 +103,12 @@ export function buildScreeningWorker({ client, logger, signal } = {}) {
       connection: redisConnection(),
       // THE DIAL.
       concurrency: env.SCREENING_CONCURRENCY,
+      // How long to block on an empty queue. A cost control on a metered Redis,
+      // not a latency knob: raising it divides the idle command rate
+      // proportionally, and a job added meanwhile wakes the blocked `bzpopmin`
+      // immediately rather than waiting the timeout out. See the note in
+      // `config/env.js` and the measurements in `test/queue/idleCost.test.js`.
+      drainDelay: env.SCREENING_DRAIN_DELAY_S,
       lockDuration: LOCK_DURATION_MS,
       stalledInterval: STALLED_INTERVAL_MS,
       // One stall is a crashed worker and worth re-running. Repeated stalls on
@@ -98,18 +119,34 @@ export function buildScreeningWorker({ client, logger, signal } = {}) {
   );
 }
 
-async function main() {
-  const log = pino({
-    level: env.LOG_LEVEL,
-    redact: { paths: [...REDACTED_LOG_PATHS], censor: '[redacted]' },
-  });
+/**
+ * Builds a worker, attaches its logging, and returns it with the drain that
+ * stops it cleanly.
+ *
+ * This exists so that `main()` below and `server.js`'s co-located mode run
+ * **identical** shutdown code rather than two similar-looking copies. The drain
+ * is the part with the subtle ordering in it, and a second copy of it is a
+ * second thing to get wrong on the day somebody edits one.
+ *
+ * It deliberately does **not** close the Redis connection, the pool or the
+ * storage client. Those are process-wide and belong to whoever owns the process:
+ * `main()` here, `server.js` there. A worker that closed the pool out from under
+ * an API still answering requests would be the co-located mode's first bug.
+ *
+ * @param {object} [options]
+ * @param {any} [options.logger]
+ * @param {{ messages: { create: Function, parse: Function } }} [options.client]
+ * @param {number} [options.graceMs] overridable for tests; never in production
+ * @returns {{ worker: Worker, close: () => Promise<void> }}
+ */
+export function startScreeningWorker({ logger, client, graceMs = DRAIN_GRACE_MS } = {}) {
+  const log = logger ?? pino({ level: env.LOG_LEVEL, redact: { paths: [...REDACTED_LOG_PATHS], censor: '[redacted]' } });
 
-  // One controller for the whole process: every in-flight candidate's model
-  // calls hang off it, so a drain that runs out of patience cancels them all at
-  // once rather than waiting for the slowest.
+  // One controller for every in-flight candidate's model calls, so a drain that
+  // runs out of patience cancels them all at once rather than waiting for the
+  // slowest.
   const drain = new AbortController();
-
-  const worker = buildScreeningWorker({ logger: log, signal: drain.signal });
+  const worker = buildScreeningWorker({ client, logger: log, signal: drain.signal });
 
   worker.on('failed', (job, error) => {
     log.error(
@@ -131,26 +168,50 @@ async function main() {
     'screening worker started',
   );
 
+  return {
+    worker,
+    close: async () => {
+      log.info({ graceMs }, 'draining screening worker');
+
+      const abortTimer = setTimeout(() => {
+        log.warn('drain grace expired; aborting in-flight candidates');
+        drain.abort();
+      }, graceMs);
+      // Do not hold the process open just to fire the abort.
+      abortTimer.unref?.();
+
+      try {
+        // `false` means "wait for in-flight jobs"; the abort above is what
+        // bounds that wait. An aborted model call raises a retryable
+        // AGENT_TIMEOUT, and the processor releases the candidate back to
+        // `pending` on its ordinary failure path - which is why a drained
+        // candidate is re-screenable rather than stranded in `evaluating`.
+        await worker.close(false);
+      } finally {
+        clearTimeout(abortTimer);
+      }
+    },
+  };
+}
+
+async function main() {
+  const log = pino({
+    level: env.LOG_LEVEL,
+    redact: { paths: [...REDACTED_LOG_PATHS], censor: '[redacted]' },
+  });
+
+  const { close } = startScreeningWorker({ logger: log });
+
   let closing = false;
   const shutdown = async (/** @type {string} */ signal) => {
     if (closing) return;
     closing = true;
 
-    log.info({ signal, graceMs: DRAIN_GRACE_MS }, 'draining screening worker');
-
-    const abortTimer = setTimeout(() => {
-      log.warn('drain grace expired; aborting in-flight candidates');
-      drain.abort();
-    }, DRAIN_GRACE_MS);
-    // Do not hold the process open just to fire the abort.
-    abortTimer.unref?.();
-
+    log.info({ signal }, 'shutting down');
     try {
-      // `false` means "wait for in-flight jobs"; the abort above is what bounds
-      // that wait.
-      await worker.close(false);
+      await close();
     } finally {
-      clearTimeout(abortTimer);
+      await closeStorage();
       await closeRedis();
       await closePool();
     }
