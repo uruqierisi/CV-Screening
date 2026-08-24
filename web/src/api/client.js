@@ -22,8 +22,7 @@
  *   code string.
  */
 
-/** Same-origin. The dev server proxies `/api` to the API (see `vite.config.js`). */
-const API_BASE = '/api/v1';
+import { API_BASE, spendingHeaders } from './config.js';
 
 /**
  * A failed request, with everything the envelope carried.
@@ -96,16 +95,24 @@ export function toQueryString(params) {
  * @param {string} [options.method]
  * @param {unknown} [options.body] serialized as JSON when present
  * @param {AbortSignal} [options.signal]
+ * @param {boolean} [options.spending] true for an endpoint that costs API
+ *   credit, which attaches the upload token when one is configured
  * @returns {Promise<{ data: any, meta: any }>}
  * @throws {ApiError}
  */
-export async function request(path, { method = 'GET', body, signal } = {}) {
+export async function request(path, { method = 'GET', body, signal, spending = false } = {}) {
   let response;
   try {
     response = await fetch(`${API_BASE}${path}`, {
       method,
       signal,
-      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+      headers: {
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        // Only on the endpoints that spend API money. Sending it everywhere
+        // would put a custom header on the dashboard's three-second poll, which
+        // turns every one of those into a CORS preflight plus a request.
+        ...(spending ? spendingHeaders() : {}),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch (error) {

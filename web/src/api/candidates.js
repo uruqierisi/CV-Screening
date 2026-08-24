@@ -99,5 +99,7 @@ export function getCandidate(candidateId, { includeRawText, signal } = {}) {
  * @param {string} candidateId
  */
 export function retryCandidate(candidateId) {
-  return request(`/candidates/${candidateId}/retry`, { method: 'POST' });
+  // `spending: true` - a retry re-runs both model calls from scratch, so it
+  // costs exactly what an upload costs and the API guards it identically.
+  return request(`/candidates/${candidateId}/retry`, { method: 'POST', spending: true });
 }

@@ -1,0 +1,130 @@
+# Render Blueprint: the API, with the screening worker co-located inside it.
+#
+# ## Why one service and not two
+#
+# The architecture is two processes - `src/server.js` and `src/worker.js` - and
+# that is still what runs in development and in any paid deployment. Render's
+# free tier offers web services only; a Background Worker starts at a paid
+# instance. Since the project's constraint is zero cost, the worker runs inside
+# the API process, selected by `RUN_WORKER_IN_PROCESS` below.
+#
+# That flag changes *where* `startScreeningWorker()` is called and nothing else:
+# the same builder, the same concurrency, the same lock duration, the same drain.
+# What it costs is fault isolation - a crash while parsing a PDF now takes the
+# HTTP API down with it - and that is recorded in the README's Known Limitations.
+#
+# To split them again on a paid plan: set `RUN_WORKER_IN_PROCESS=false` here, add
+# a second service of `type: worker` with `startCommand: npm run worker` and the
+# same environment, and change nothing in the code.
+#
+# ## What this file does NOT contain
+#
+# No connection strings, no keys, no bucket credentials. Everything marked
+# `sync: false` is set once in the Render dashboard and never committed. The
+# blueprint is a topology, not a secret store.
+#
+# Postgres and Redis are deliberately not declared here either: they are Neon and
+# Upstash, both outside Render, both chosen because their free tiers do not
+# expire. Declaring a Render database would provision one that does.
+
+services:
+  - type: web
+    name: cv-screening-api
+    runtime: node
+    plan: free
+    # The repository root holds `server/` and `web/`; this service is the server.
+    rootDir: server
+    # `npm ci` rather than `npm install`: the lockfile is the point of a
+    # deployment build. Note that `node-pg-migrate` is a runtime dependency
+    # rather than a dev one - Render sets NODE_ENV=production, under which
+    # `npm ci` omits devDependencies, and `scripts/migrate.js` imports it at
+    # module load.
+    buildCommand: npm ci
+    startCommand: npm start
+    # The full path, including the version prefix. It reports the database and
+    # Redis separately and answers 503 if either is unreachable - so a bad
+    # REDIS_URL presents as a failed deploy rather than as a live API with a red
+    # dependency. That is deliberate; a green health check on a broken queue is
+    # worse than no health check.
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Pinned rather than inherited: package.json requires >=22, and a silent
+      # platform default of 20 fails at a syntax nobody will look for.
+      - key: NODE_VERSION
+        value: "22"
+
+      # --- the co-located worker ------------------------------------------
+      - key: RUN_WORKER_IN_PROCESS
+        value: "true"
+
+      # --- backing services (set in the dashboard) -------------------------
+      # Neon, POOLED endpoint, with `?sslmode=verify-full`. Use the pooled host
+      # for the running service and the DIRECT host for migrations: node-pg-migrate
+      # takes a session-level advisory lock, which does not survive a
+      # transaction-mode pooler.
+      - key: DATABASE_URL
+        sync: false
+      # Upstash, `rediss://`. TLS is required and already permitted by the env
+      # schema.
+      - key: REDIS_URL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+      # --- object storage --------------------------------------------------
+      # Backblaze B2. Without this the API and the worker would share the
+      # service's local disk, which Render resets on every restart - so a retry
+      # after any idle period would answer SOURCE_FILE_MISSING.
+      - key: STORAGE_DRIVER
+        value: s3
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+
+      # --- the browser client ----------------------------------------------
+      # A comma-separated allowlist of bare origins - scheme, host, optional
+      # port, no path and no trailing slash. The Vercel production URL goes
+      # here. A mismatch is invisible in these logs (the plugin simply omits the
+      # header and the request logs as a normal 200), which is why `server.js`
+      # prints the parsed allowlist at boot.
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+      # --- cost guards ------------------------------------------------------
+      # The shared secret on the two upload endpoints and on retry. The frontend
+      # sends it as VITE_UPLOAD_TOKEN, which is compiled into the bundle and is
+      # therefore public - a speed bump against a crawler, not an access control.
+      # The two values must match.
+      - key: UPLOAD_ACCESS_TOKEN
+        sync: false
+
+      # One candidate at a time: spend is serial and observable, which matters on
+      # a nearly-exhausted API budget more than throughput does.
+      - key: SCREENING_CONCURRENCY
+        value: "1"
+      # Two, not the default three. A BullMQ attempt re-runs both model calls
+      # from scratch, so three attempts is triple spend in the bad case; two
+      # keeps one recovery from a transient 429 without that.
+      - key: SCREENING_JOB_ATTEMPTS
+        value: "2"
+      # Five, not fifty. At roughly $0.12 a candidate a fifty-file batch is $6,
+      # which is several times the remaining balance.
+      - key: MAX_BATCH_FILES
+        value: "5"
+      # How long the worker blocks on an empty queue, seconds. A cost control
+      # rather than a tuning knob: measured against bullmq@6.1.2, the library
+      # default of 5 costs ~6,400 Redis commands per awake hour, which is 79
+      # hours against Upstash's 500,000-per-month free tier. At 30 it is ~1,600,
+      # and a job added meanwhile still wakes the worker immediately - both
+      # figures are asserted in test/queue/idleCost.test.js.
+      - key: SCREENING_DRAIN_DELAY_S
+        value: "30"

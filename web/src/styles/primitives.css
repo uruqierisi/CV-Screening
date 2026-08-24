@@ -36,10 +36,23 @@
 
 .app-gate {
   display: flex;
+  /* Column, so the slow-request hint sits under the spinner rather than beside
+     it. Centred as before when it is the only child, which is the usual case. */
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: var(--space-3);
   min-height: 60vh;
   padding: var(--space-6);
+}
+
+/* Shown only after the wait is already abnormal - see `useSlowRequest`. Muted
+   and smaller than the spinner label: it is an explanation, not an error. */
+.app-gate__hint {
+  max-width: 34rem;
+  color: var(--ink-soft);
+  font-size: var(--text-sm);
+  text-align: center;
 }
 
 .app-header {

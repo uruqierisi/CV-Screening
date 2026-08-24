@@ -18,8 +18,7 @@
  */
 
 import { ApiError } from './client.js';
-
-const API_BASE = '/api/v1';
+import { API_BASE, spendingHeaders } from './config.js';
 
 /**
  * @typedef {object} UploadHandle
@@ -56,6 +55,13 @@ export function uploadCandidates({ roleId, files, onProgress }) {
 
   const result = new Promise((resolve, reject) => {
     xhr.open('POST', `${API_BASE}${path}`);
+
+    // After `open` and before `send`, which is the only window where
+    // `setRequestHeader` is legal. Uploads are one of the three endpoints the
+    // API's spend guard covers.
+    for (const [name, value] of Object.entries(spendingHeaders())) {
+      xhr.setRequestHeader(name, value);
+    }
 
     if (onProgress) {
       xhr.upload.addEventListener('progress', (event) => {
